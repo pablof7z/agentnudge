@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AgentNudge demo</title>
+    <style>
+      :root { color: #20201e; background: #f2efe5; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; }
+      nav { display: flex; justify-content: space-between; padding: 24px 7vw; }
+      nav strong { letter-spacing: -.03em; }
+      main { width: min(1080px, 86vw); margin: 9vh auto; }
+      .eyebrow { color: #667328; text-transform: uppercase; letter-spacing: .12em; font-size: 12px; font-weight: 750; }
+      h1 { max-width: 760px; margin: 14px 0 18px; font-size: clamp(42px, 7vw, 88px); line-height: .95; letter-spacing: -.06em; font-weight: 780; }
+      .lead { max-width: 580px; color: #64615a; font-size: 18px; line-height: 1.55; }
+      .actions { display: flex; align-items: center; gap: 12px; margin-top: 36px; }
+      button { border: 1px solid #20201e; border-radius: 999px; padding: 12px 18px; background: #20201e; color: white; font: inherit; cursor: pointer; }
+      .misplaced { margin-left: auto; background: #e96a45; border-color: #e96a45; }
+      .target { width: 190px; height: 62px; margin-top: 80px; border: 2px dashed #9ba668; border-radius: 12px; display: grid; place-items: center; color: #667328; }
+      .secret { margin-top: 42px; display: grid; gap: 6px; max-width: 320px; color: #64615a; font-size: 13px; }
+      input { border: 1px solid #c8c3b6; border-radius: 8px; padding: 10px; background: white; }
+    </style>
+  </head>
+  <body>
+    <nav><strong>Northstar</strong><span>Demo page</span></nav>
+    <main>
+      <div class="eyebrow">A local feedback rendezvous</div>
+      <h1>Point at the interface. Tell the agent what changes.</h1>
+      <p class="lead">Open the small N button, choose “Move this,” click the orange button, and then click the dashed destination.</p>
+      <div class="actions">
+        <button>Primary action</button>
+        <button id="misplaced-button" class="misplaced">I am in the wrong place</button>
+      </div>
+      <div class="target">Move it here</div>
+      <label class="secret">Sensitive input is masked in screenshots
+        <input type="text" value="this value must not be captured">
+      </label>
+    </main>
+    <script type="module" src="http://127.0.0.1:4317/widget.js"></script>
+  </body>
+</html>
