@@ -13,6 +13,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-When changing the widget, also exercise the demo in a real browser and verify the screenshot and `message.json` returned by `agentnudge next`, then send a reply and confirm it appears in the sidebar.
+When changing the widget or broker, exercise the demo in a real browser with a session-specific URL. Verify that `agentnudge wait SESSION TIME` returns the screenshot and `message.json`, then run `agentnudge reply SESSION TIME`, confirm the reply appears in the sidebar, and verify the next message completes that same foreground command.
+
+When changing session routing, create at least two simultaneous word sessions and prove that a message submitted to one cannot complete a wait on the other. End both sessions after the test.
 
 Do not add console logs, network requests, browser storage, full DOM, or form values to the feedback packet by default. Captured page content must remain bounded and explicitly untrusted.

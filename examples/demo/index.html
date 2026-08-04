@@ -49,6 +49,14 @@
         <input type="text" value="this value must not be captured">
       </label>
     </main>
-    <script type="module" src="http://127.0.0.1:4317/widget.js"></script>
+    <script type="module">
+      const session = new URLSearchParams(location.search).get("agentnudge");
+      if (session && /^[a-z]+$/.test(session)) {
+        const widget = document.createElement("script");
+        widget.type = "module";
+        widget.src = `http://127.0.0.1:4317/${session}/widget.js`;
+        document.body.append(widget);
+      }
+    </script>
   </body>
 </html>

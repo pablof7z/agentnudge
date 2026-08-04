@@ -3,12 +3,15 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 7;
 pub const MAX_MESSAGE_CHARS: usize = 10_000;
 pub const MAX_ATTACHMENTS: usize = 100;
 pub const MAX_DRAWING_STROKES: usize = 500;
 pub const MAX_DRAWING_POINTS: usize = 50_000;
 pub const MAX_SCREENSHOT_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_REPLY_IMAGE_ATTACHMENTS: usize = 8;
+pub const MAX_REPLY_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_REPLY_IMAGE_TOTAL_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +113,8 @@ pub struct ChatMessage {
     pub in_reply_to: Option<String>,
     #[serde(default)]
     pub attachments: Vec<ContextAttachment>,
+    #[serde(default)]
+    pub image_attachments: Vec<ReplyImageAttachment>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -172,6 +177,26 @@ pub struct MessageReceipt {
 pub struct AgentReplySubmission {
     pub message: String,
     pub in_reply_to: Option<String>,
+    #[serde(default)]
+    pub attachments: Vec<AgentReplyImageUpload>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentReplyImageUpload {
+    pub file_name: String,
+    pub media_type: String,
+    pub data_base64: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplyImageAttachment {
+    pub id: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub size_bytes: usize,
+    pub asset_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -181,17 +206,6 @@ pub struct ReplyReceipt {
     pub status: String,
     pub message_id: String,
     pub sequence: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionDescriptor {
-    pub version: u8,
-    pub endpoint: String,
-    pub session_id: String,
-    pub agent_token: String,
-    pub allowed_origin: String,
-    pub output_directory: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -374,13 +388,33 @@ impl ContextAttachment {
 impl AgentReplySubmission {
     pub fn validate_and_sanitize(mut self) -> Result<Self, String> {
         self.message = self.message.trim().to_string();
-        if self.message.is_empty() {
-            return Err("an agent reply cannot be empty".into());
-        }
         if self.message.chars().count() > MAX_MESSAGE_CHARS {
             return Err(format!(
                 "the reply exceeds the {MAX_MESSAGE_CHARS}-character limit"
             ));
+        }
+        if self.attachments.len() > MAX_REPLY_IMAGE_ATTACHMENTS {
+            return Err(format!(
+                "the reply exceeds the {MAX_REPLY_IMAGE_ATTACHMENTS}-image limit"
+            ));
+        }
+        if self.message.is_empty() && self.attachments.is_empty() {
+            return Err("an agent reply needs text or at least one image".into());
+        }
+        for attachment in &mut self.attachments {
+            attachment.file_name = attachment.file_name.trim().to_string();
+            validate_reply_image_filename(&attachment.file_name)?;
+            if !matches!(attachment.media_type.as_str(), "image/png" | "image/jpeg") {
+                return Err("reply images must use the image/png or image/jpeg media type".into());
+            }
+            let max_base64_len = MAX_REPLY_IMAGE_BYTES.div_ceil(3) * 4;
+            if attachment.data_base64.is_empty() || attachment.data_base64.len() > max_base64_len {
+                return Err(format!(
+                    "reply image `{}` exceeds the {} MiB limit",
+                    attachment.file_name,
+                    MAX_REPLY_IMAGE_BYTES / (1024 * 1024)
+                ));
+            }
         }
         self.in_reply_to = self
             .in_reply_to
@@ -389,6 +423,19 @@ impl AgentReplySubmission {
             .filter(|value| !value.is_empty());
         Ok(self)
     }
+}
+
+fn validate_reply_image_filename(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value == "."
+        || value == ".."
+        || value.chars().count() > 180
+        || value.chars().any(char::is_control)
+        || value.contains(['/', '\\'])
+    {
+        return Err("every reply image needs a useful file name without path components".into());
+    }
+    Ok(())
 }
 
 fn sanitize_page(page: &mut PageContext) -> Result<(), String> {
@@ -554,5 +601,42 @@ mod tests {
     fn summarizes_element_context_for_the_agent() {
         let value = submission().validate_and_sanitize("session").unwrap();
         assert_eq!(value.attachments[0].summary(), "button \"Save\" (#save)");
+    }
+
+    #[test]
+    fn accepts_text_only_and_image_only_agent_replies() {
+        let text = AgentReplySubmission {
+            message: " Ready ".into(),
+            in_reply_to: None,
+            attachments: vec![],
+        }
+        .validate_and_sanitize()
+        .unwrap();
+        assert_eq!(text.message, "Ready");
+
+        let image = AgentReplySubmission {
+            message: String::new(),
+            in_reply_to: None,
+            attachments: vec![AgentReplyImageUpload {
+                file_name: "preview.png".into(),
+                media_type: "image/png".into(),
+                data_base64: "iVBORw0KGgo=".into(),
+            }],
+        };
+        assert!(image.validate_and_sanitize().is_ok());
+    }
+
+    #[test]
+    fn rejects_reply_image_paths_and_unsupported_media_types() {
+        let invalid = AgentReplySubmission {
+            message: "See this".into(),
+            in_reply_to: None,
+            attachments: vec![AgentReplyImageUpload {
+                file_name: "../preview.svg".into(),
+                media_type: "image/svg+xml".into(),
+                data_base64: "PHN2Zz4=".into(),
+            }],
+        };
+        assert!(invalid.validate_and_sanitize().is_err());
     }
 }

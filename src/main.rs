@@ -3,9 +3,11 @@ mod server;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
-use server::{SessionConfig, SessionResult};
+use server::{BrokerConfig, SessionConfig};
 use url::Url;
 
 #[derive(Debug, Parser)]
@@ -13,7 +15,7 @@ use url::Url;
     name = "agentnudge",
     version,
     about = "Chat with a coding agent from the UI it is building",
-    long_about = "AgentNudge runs a local development-only chat sidebar. Page elements, regions, and drawings become visual attachments to messages consumed and answered by a coding agent."
+    long_about = "AgentNudge runs isolated local chat sessions. Page elements, regions, and drawings become visual attachments delivered through timed foreground waits to coding agents."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -22,38 +24,34 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the local widget and conversation server until cancelled.
+    /// Create an isolated local chat session and return its short ID.
     Session {
         /// Exact browser origin allowed to use the widget.
         #[arg(long, default_value = "http://localhost:5173")]
         origin: Url,
 
-        /// Loopback port used by the development widget.
-        #[arg(long, default_value_t = 4317)]
-        port: u16,
-
-        /// Directory where message evidence bundles are written.
+        /// Directory where per-session message evidence bundles are written.
         #[arg(short, long, default_value = ".agentnudge/messages")]
         output: PathBuf,
-
-        /// Private descriptor used by the agent-facing commands.
-        #[arg(long, default_value = ".agentnudge/session.json")]
-        session_file: PathBuf,
     },
 
-    /// Wait for the next user message, print it, then exit.
-    Next {
-        /// Private descriptor written by `agentnudge session`.
-        #[arg(long, default_value = ".agentnudge/session.json")]
-        session_file: PathBuf,
+    /// Wait in the foreground for feedback in a session.
+    Wait {
+        /// Short session ID returned by `agentnudge session`.
+        session: String,
 
-        /// Print a stable JSON message receipt to stdout.
-        #[arg(long)]
-        json: bool,
+        /// Maximum foreground wait, such as 30s, 10m, or 1h.
+        duration: String,
     },
 
-    /// Send an agent reply to the chat sidebar.
+    /// Send an agent reply, then wait in the foreground for the next message.
     Reply {
+        /// Short session ID returned by `agentnudge session`.
+        session: String,
+
+        /// Maximum foreground wait after sending, such as 30s, 10m, or 1h.
+        duration: String,
+
         /// Reply text shown in the sidebar.
         #[arg(short, long)]
         message: String,
@@ -62,13 +60,25 @@ enum Command {
         #[arg(long)]
         in_reply_to: Option<String>,
 
-        /// Private descriptor written by `agentnudge session`.
-        #[arg(long, default_value = ".agentnudge/session.json")]
-        session_file: PathBuf,
+        /// Local PNG or JPEG to include with the reply; repeat for multiple images.
+        #[arg(long = "attach", value_name = "PATH")]
+        attachments: Vec<PathBuf>,
+    },
 
-        /// Print a stable JSON receipt to stdout.
+    /// End an active session and release its short ID.
+    EndSession {
+        /// Short session ID returned by `agentnudge session`.
+        session: String,
+    },
+
+    /// Internal persistent broker process.
+    #[command(hide = true)]
+    Broker {
         #[arg(long)]
-        json: bool,
+        port: u16,
+
+        #[arg(long)]
+        descriptor_file: PathBuf,
     },
 }
 
@@ -86,53 +96,113 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     match cli.command {
-        Command::Session {
-            origin,
-            port,
-            output,
-            session_file,
-        } => match server::run_session(SessionConfig {
-            origin,
-            port,
-            output,
-            session_file,
-        })
-        .await?
-        {
-            SessionResult::Cancelled => {
-                eprintln!("AgentNudge session stopped.");
-                Ok(ExitCode::from(130))
-            }
-        },
-        Command::Next { session_file, json } => {
-            let message = server::next_message(&session_file).await?;
-            if json {
-                println!("{}", serde_json::to_string(&message)?);
-            } else {
-                println!("Message: {}", message.text);
-                println!("Page: {}", message.page_url);
-                for (index, attachment) in message.attachments.iter().enumerate() {
-                    println!("Attachment {}: {}", index + 1, attachment.summary);
-                }
-                println!("Message ID: {}", message.message_id);
-                println!("Manifest: {}", message.manifest_path);
-                println!("Screenshot: {}", message.screenshot_path);
-            }
+        Command::Session { origin, output } => {
+            let created = server::start_session(SessionConfig { origin, output }).await?;
+            println!("{}", serde_json::to_string(&created)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Wait { session, duration } => {
+            let duration = parse_wait_duration(&duration)?;
+            let response = server::wait_for_message(&session, duration).await?;
+            println!("{}", serde_json::to_string(&response)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Reply {
+            session,
+            duration,
             message,
             in_reply_to,
-            session_file,
-            json,
+            attachments,
         } => {
-            let receipt = server::send_reply(&session_file, message, in_reply_to).await?;
-            if json {
-                println!("{}", serde_json::to_string(&receipt)?);
-            } else {
-                println!("Reply sent: {}", receipt.message_id);
-            }
+            let duration = parse_wait_duration(&duration)?;
+            let response =
+                server::reply_and_wait(&session, duration, message, in_reply_to, attachments)
+                    .await?;
+            println!("{}", serde_json::to_string(&response)?);
             Ok(ExitCode::SUCCESS)
         }
+        Command::EndSession { session } => {
+            let receipt = server::end_session(&session).await?;
+            println!("{}", serde_json::to_string(&receipt)?);
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Broker {
+            port,
+            descriptor_file,
+        } => {
+            server::run_broker(BrokerConfig {
+                port,
+                descriptor_file,
+            })
+            .await?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+fn parse_wait_duration(value: &str) -> anyhow::Result<Duration> {
+    let duration = humantime::parse_duration(value).with_context(|| {
+        format!("`{value}` is not a valid duration; use values such as 30s or 10m")
+    })?;
+    if duration > Duration::from_secs(24 * 60 * 60) {
+        bail!("the wait duration cannot exceed 24 hours");
+    }
+    Ok(duration)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_human_wait_durations() {
+        assert_eq!(parse_wait_duration("30s").unwrap(), Duration::from_secs(30));
+        assert_eq!(
+            parse_wait_duration("10m").unwrap(),
+            Duration::from_secs(600)
+        );
+        assert_eq!(parse_wait_duration("0s").unwrap(), Duration::ZERO);
+        assert!(parse_wait_duration("forever").is_err());
+        assert!(parse_wait_duration("25h").is_err());
+    }
+
+    #[test]
+    fn parses_the_public_session_commands() {
+        assert!(matches!(
+            Cli::try_parse_from(["agentnudge", "wait", "lima", "10m"])
+                .unwrap()
+                .command,
+            Command::Wait { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["agentnudge", "reply", "lima", "10m", "--message", "Done"])
+                .unwrap()
+                .command,
+            Command::Reply { .. }
+        ));
+        let command = Cli::try_parse_from([
+            "agentnudge",
+            "reply",
+            "lima",
+            "0s",
+            "--message",
+            "See these",
+            "--attach",
+            "first.png",
+            "--attach",
+            "second.jpg",
+        ])
+        .unwrap()
+        .command;
+        match command {
+            Command::Reply { attachments, .. } => assert_eq!(attachments.len(), 2),
+            _ => panic!("expected reply command"),
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["agentnudge", "end-session", "lima"])
+                .unwrap()
+                .command,
+            Command::EndSession { .. }
+        ));
     }
 }

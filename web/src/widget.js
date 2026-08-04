@@ -1,5 +1,6 @@
 import html2canvas from "html2canvas";
 import { paintMessageAttachments } from "./annotation-overlay.js";
+import { replyImageLabel, replyImageRequestUrl } from "./reply-images.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
@@ -147,7 +148,7 @@ const css = String.raw`
   .icon-button[data-active="true"] { background: var(--accent-soft); color: var(--accent); }
   .icon-button:disabled { opacity: .35; cursor: default; }
   .icon-button svg { width: 18px; height: 18px; display: block; }
-  .icon-button:focus-visible, .launcher:focus-visible, textarea:focus-visible, .attachment-chip:focus-visible {
+  .icon-button:focus-visible, .launcher:focus-visible, textarea:focus-visible, .attachment-chip:focus-visible, .reply-image-card:focus-visible {
     outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent);
     outline-offset: 2px;
   }
@@ -176,6 +177,23 @@ const css = String.raw`
   .message-attachment:hover, .message-attachment[data-active="true"] { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); color: var(--text); }
   .attachment-number { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #fffaf6; font-size: 10px; font-weight: 800; }
   .message-attachment span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+  .reply-reference { max-width: 88%; margin: -1px 5px 6px; color: var(--faint); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .reply-images { width: min(88%, 310px); display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 7px; margin-top: 7px; }
+  .reply-image-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; padding: 0; background: var(--raised); color: var(--text); text-align: left; cursor: zoom-in; box-shadow: 0 2px 7px rgb(24 22 18 / .04); }
+  .reply-image-card:hover { border-color: color-mix(in srgb, var(--accent) 44%, var(--line)); }
+  .reply-image-media { height: 112px; display: grid; place-items: center; overflow: hidden; background: var(--soft); color: var(--faint); font-size: 10px; }
+  .reply-image-media img { width: 100%; height: 100%; display: block; object-fit: cover; }
+  .reply-image-media img:not([src]) { visibility: hidden; }
+  .reply-image-name { display: block; overflow: hidden; padding: 7px 8px; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+  .image-viewer { position: fixed; z-index: 8; inset: 0; display: grid; place-items: center; padding: 28px; background: rgb(18 17 15 / .78); opacity: 0; pointer-events: none; transition: opacity 150ms ease; }
+  .image-viewer[data-open="true"] { opacity: 1; pointer-events: auto; }
+  .image-viewer-card { position: relative; width: min(900px, 94vw); max-height: 90vh; display: grid; grid-template-rows: minmax(0, 1fr) auto; overflow: hidden; border: 1px solid rgb(255 255 255 / .22); border-radius: 16px; background: var(--panel); box-shadow: 0 30px 90px rgb(0 0 0 / .4); }
+  .image-viewer-media { min-height: 180px; display: grid; place-items: center; overflow: auto; background: #161613; color: #ddd8ce; }
+  .image-viewer-media img { display: block; max-width: 100%; max-height: calc(90vh - 54px); object-fit: contain; }
+  .image-viewer-media img:not([src]) { display: none; }
+  .image-viewer-caption { min-width: 0; overflow: hidden; padding: 11px 52px 11px 14px; color: var(--muted); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+  .image-viewer-close { position: absolute; z-index: 1; right: 8px; bottom: 7px; background: var(--soft); color: var(--text); }
 
   .composer-wrap { padding: 0 10px 10px; }
   .composer {
@@ -271,6 +289,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.sending = false;
     this.undoStack = [];
     this.redoStack = [];
+    this.replyImageCache = new Map();
     this.abort = new AbortController();
     this.pollAbort = new AbortController();
 
@@ -309,6 +328,13 @@ class AgentNudgeWidget extends HTMLElement {
           ${iconButtonMarkup("capture-finish", "Finish attaching", iconCheck)}
         </div>
         <svg class="overlay" aria-hidden="true"></svg>
+        <div class="image-viewer" data-open="false" role="dialog" aria-modal="true" aria-label="Attached image preview">
+          <div class="image-viewer-card">
+            <div class="image-viewer-media"><span>Loading image…</span><img alt=""></div>
+            <div class="image-viewer-caption"></div>
+            ${iconButtonMarkup("image-viewer-close", "Close image preview", iconX)}
+          </div>
+        </div>
       </div>
     `;
     this.shell = this.shadowRoot.querySelector(".shell");
@@ -321,6 +347,10 @@ class AgentNudgeWidget extends HTMLElement {
     this.sendButton = this.shadowRoot.querySelector(".send-button");
     this.overlay = this.shadowRoot.querySelector(".overlay");
     this.captureModeNode = this.shadowRoot.querySelector(".capture-mode");
+    this.imageViewer = this.shadowRoot.querySelector(".image-viewer");
+    this.imageViewerImage = this.shadowRoot.querySelector(".image-viewer img");
+    this.imageViewerStatus = this.shadowRoot.querySelector(".image-viewer-media span");
+    this.imageViewerCaption = this.shadowRoot.querySelector(".image-viewer-caption");
   }
 
   connectedCallback() {
@@ -333,6 +363,10 @@ class AgentNudgeWidget extends HTMLElement {
     this.shadowRoot.querySelector(".capture-undo").addEventListener("click", () => this.undoCapture(), { signal });
     this.shadowRoot.querySelector(".capture-redo").addEventListener("click", () => this.redoCapture(), { signal });
     this.shadowRoot.querySelector(".capture-finish").addEventListener("click", () => this.finishCapture(), { signal });
+    this.shadowRoot.querySelector(".image-viewer-close").addEventListener("click", () => this.closeReplyImage(), { signal });
+    this.imageViewer.addEventListener("click", (event) => {
+      if (event.target === this.imageViewer) this.closeReplyImage();
+    }, { signal });
     this.sendButton.addEventListener("click", () => this.send(), { signal });
     this.textarea.addEventListener("input", () => this.onTextInput(), { signal });
     this.textarea.addEventListener("keydown", (event) => this.onComposerKeyDown(event), { signal });
@@ -351,6 +385,10 @@ class AgentNudgeWidget extends HTMLElement {
   disconnectedCallback() {
     this.abort.abort();
     this.pollAbort.abort();
+    for (const record of this.replyImageCache.values()) {
+      if (record.url) URL.revokeObjectURL(record.url);
+    }
+    this.replyImageCache.clear();
   }
 
   open() {
@@ -525,7 +563,10 @@ class AgentNudgeWidget extends HTMLElement {
       return;
     }
     if (event.key !== "Escape") return;
-    if (this.mode !== "idle") {
+    if (this.imageViewer.dataset.open === "true") {
+      event.preventDefault();
+      this.closeReplyImage();
+    } else if (this.mode !== "idle") {
       event.preventDefault();
       this.finishCapture();
     } else if (this.opened && !event.composedPath().includes(this.textarea)) {
@@ -796,13 +837,23 @@ class AgentNudgeWidget extends HTMLElement {
     for (const message of this.messages) {
       const article = document.createElement("article");
       article.className = `message ${message.role}`;
+      article.dataset.messageId = message.id;
       const label = document.createElement("div");
       label.className = "message-label";
       label.textContent = message.role === "agent" ? "Agent" : "You";
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-      bubble.textContent = message.text || "Attached context";
-      article.append(label, bubble);
+      bubble.textContent = message.text || (message.imageAttachments?.length ? "Attached image" : "Attached context");
+      article.append(label);
+      if (message.inReplyTo) {
+        const target = this.messages.find((value) => value.id === message.inReplyTo);
+        const reference = document.createElement("div");
+        reference.className = "reply-reference";
+        reference.textContent = target?.role === "user" ? "Replying to your message" : "Replying to an earlier message";
+        if (target?.text) reference.title = truncate(target.text, 120);
+        article.append(reference);
+      }
+      article.append(bubble);
       if (message.attachments?.length) {
         const attachments = document.createElement("div");
         attachments.className = "message-attachments";
@@ -823,9 +874,102 @@ class AgentNudgeWidget extends HTMLElement {
         });
         article.append(attachments);
       }
+      if (message.imageAttachments?.length) {
+        const images = document.createElement("div");
+        images.className = "reply-images";
+        for (const attachment of message.imageAttachments) {
+          const card = document.createElement("button");
+          card.type = "button";
+          card.className = "reply-image-card";
+          card.title = `Enlarge ${replyImageLabel(attachment)}`;
+          const media = document.createElement("span");
+          media.className = "reply-image-media";
+          const loading = document.createElement("span");
+          loading.textContent = "Loading image…";
+          const image = document.createElement("img");
+          image.alt = replyImageLabel(attachment);
+          const name = document.createElement("span");
+          name.className = "reply-image-name";
+          name.textContent = replyImageLabel(attachment);
+          media.append(loading, image);
+          card.append(media, name);
+          card.addEventListener("click", () => this.openReplyImage(attachment));
+          images.append(card);
+          this.populateReplyImage(attachment, image, loading);
+        }
+        article.append(images);
+      }
       this.messagesNode.append(article);
     }
     this.messagesNode.scrollTop = oldScroll;
+  }
+
+  async populateReplyImage(attachment, image, status) {
+    try {
+      const url = await this.replyImageObjectUrl(attachment);
+      if (!image.isConnected) return;
+      image.src = url;
+      status.remove();
+    } catch (error) {
+      if (!status.isConnected || this.pollAbort.signal.aborted) return;
+      console.error("AgentNudge reply image failed", error);
+      status.textContent = "Image unavailable";
+    }
+  }
+
+  async replyImageObjectUrl(attachment) {
+    const requestUrl = replyImageRequestUrl(ENDPOINT, SESSION_ID, attachment);
+    if (!requestUrl) throw new Error("Invalid reply image descriptor");
+    const existing = this.replyImageCache.get(attachment.id);
+    if (existing) return existing.promise;
+
+    const record = { url: null, promise: null };
+    record.promise = (async () => {
+      const response = await fetch(requestUrl, {
+        method: "GET",
+        mode: "cors",
+        cache: "force-cache",
+        headers: { "X-AgentNudge-Token": BROWSER_TOKEN },
+        signal: this.pollAbort.signal,
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const blob = await response.blob();
+      if (!blob.type.startsWith("image/")) throw new Error("Reply asset is not an image");
+      record.url = URL.createObjectURL(blob);
+      return record.url;
+    })();
+    this.replyImageCache.set(attachment.id, record);
+    try {
+      return await record.promise;
+    } catch (error) {
+      this.replyImageCache.delete(attachment.id);
+      throw error;
+    }
+  }
+
+  async openReplyImage(attachment) {
+    this.imageViewer.dataset.open = "true";
+    this.imageViewerCaption.textContent = replyImageLabel(attachment);
+    this.imageViewerImage.alt = replyImageLabel(attachment);
+    this.imageViewerImage.removeAttribute("src");
+    this.imageViewerStatus.textContent = "Loading image…";
+    this.imageViewerStatus.hidden = false;
+    try {
+      const url = await this.replyImageObjectUrl(attachment);
+      if (this.imageViewer.dataset.open !== "true") return;
+      this.imageViewerImage.src = url;
+      this.imageViewerStatus.hidden = true;
+      this.shadowRoot.querySelector(".image-viewer-close").focus();
+    } catch (error) {
+      if (this.pollAbort.signal.aborted) return;
+      console.error("AgentNudge image preview failed", error);
+      this.imageViewerStatus.textContent = "Image unavailable";
+    }
+  }
+
+  closeReplyImage() {
+    this.imageViewer.dataset.open = "false";
+    this.imageViewerImage.removeAttribute("src");
   }
 
   renderOverlay() {
