@@ -81,7 +81,7 @@ pub async fn wait_for_feedback(config: WaitConfig) -> Result<WaitResult> {
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .with_state(state);
 
-    eprintln!("AgentNudge is waiting for one feedback message.");
+    eprintln!("AgentNudge is waiting for one feedback batch.");
     eprintln!("Allowed page origin: {allowed_origin}");
     eprintln!("Add this development-only script to the page:");
     eprintln!("<script type=\"module\" src=\"{endpoint}/widget.js\"></script>");
@@ -97,7 +97,7 @@ pub async fn wait_for_feedback(config: WaitConfig) -> Result<WaitResult> {
 
     let outcome = tokio::select! {
         result = submission_rx => {
-            let submission = result.context("the local feedback session closed before receiving a message")?;
+            let submission = result.context("the local feedback session closed before receiving a batch")?;
             let receipt = persist_submission(submission, &config.output, &session_id)?;
             WaitResult::Feedback(receipt)
         }
@@ -117,7 +117,7 @@ pub async fn wait_for_feedback(config: WaitConfig) -> Result<WaitResult> {
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "waiting",
-        "version": 1,
+        "version": 2,
         "sessionId": state.session_id,
         "allowedOrigin": state.allowed_origin,
     }))
@@ -286,13 +286,13 @@ fn persist_submission(
         .context("could not write the screenshot")?;
 
     let manifest = FeedbackManifest {
-        version: 1,
+        version: 2,
         received_at_unix_ms,
         session_id: submission.session_id.clone(),
         message: submission.message.clone(),
         page: submission.page.clone(),
-        selection: submission.selection.clone(),
-        arrow: submission.arrow.clone(),
+        comments: submission.comments.clone(),
+        drawings: submission.drawings.clone(),
         screenshot_path: final_screenshot.display().to_string(),
         trust: TrustBoundary {
             page_content: "untrusted",
@@ -306,12 +306,18 @@ fn persist_submission(
         .context("could not atomically finalize the feedback bundle")?;
 
     Ok(FeedbackReceipt {
-        version: 1,
+        version: 2,
         status: "received",
         message: submission.message,
         page_url: submission.page.url,
-        selection_summary: submission.selection.as_ref().map(|value| value.summary()),
-        arrow_summary: submission.arrow.as_ref().map(|value| value.summary()),
+        comment_count: submission.comments.len(),
+        drawing_stroke_count: submission.drawings.len(),
+        comment_summaries: submission
+            .comments
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value.summary(index + 1))
+            .collect(),
         manifest_path: final_manifest.display().to_string(),
         screenshot_path: final_screenshot.display().to_string(),
     })
@@ -344,7 +350,7 @@ fn absolute_path(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{PageContext, Viewport};
+    use crate::model::{DrawingStroke, PageContext, Point, Viewport};
 
     const ONE_PIXEL_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
@@ -359,7 +365,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let submission = FeedbackSubmission {
             session_id: "12345678-session".into(),
-            message: "Move the button".into(),
+            message: "Tighten this page".into(),
             page: PageContext {
                 url: "http://localhost:5173/".into(),
                 title: "Demo".into(),
@@ -371,14 +377,20 @@ mod tests {
                 },
                 device_pixel_ratio: 1.0,
             },
-            selection: None,
-            arrow: None,
+            comments: vec![],
+            drawings: vec![DrawingStroke {
+                points: vec![Point { x: 10.0, y: 20.0 }, Point { x: 30.0, y: 40.0 }],
+                color: "#dc5835".into(),
+                width: 4.0,
+            }],
             screenshot_data_url: ONE_PIXEL_PNG.into(),
         };
 
         let receipt = persist_submission(submission, temporary.path(), "12345678-session").unwrap();
         assert!(Path::new(&receipt.manifest_path).is_file());
         assert!(Path::new(&receipt.screenshot_path).is_file());
+        assert_eq!(receipt.comment_count, 0);
+        assert_eq!(receipt.drawing_stroke_count, 1);
         assert!(
             std::fs::read_to_string(receipt.manifest_path)
                 .unwrap()

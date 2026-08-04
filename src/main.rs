@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Wait for one feedback message, write its evidence bundle, then exit.
+    /// Wait for one feedback batch, write its evidence bundle, then exit.
     Wait {
         /// Exact browser origin allowed to submit feedback.
         #[arg(long, default_value = "http://localhost:5173")]
@@ -73,14 +73,15 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                     println!("{}", serde_json::to_string(&receipt)?);
                 } else {
                     println!("Feedback received");
-                    println!("Message: {}", receipt.message);
+                    if !receipt.message.is_empty() {
+                        println!("Overall note: {}", receipt.message);
+                    }
                     println!("Page: {}", receipt.page_url);
-                    if let Some(selection) = receipt.selection_summary {
-                        println!("Selection: {selection}");
+                    println!("Comments: {}", receipt.comment_count);
+                    for comment in receipt.comment_summaries {
+                        println!("  {comment}");
                     }
-                    if let Some(arrow) = receipt.arrow_summary {
-                        println!("Arrow: {arrow}");
-                    }
+                    println!("Drawing strokes: {}", receipt.drawing_stroke_count);
                     println!("Manifest: {}", receipt.manifest_path);
                     println!("Screenshot: {}", receipt.screenshot_path);
                 }

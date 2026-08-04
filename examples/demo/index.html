@@ -17,9 +17,13 @@
       .actions { display: flex; align-items: center; gap: 12px; margin-top: 36px; }
       button { border: 1px solid #20201e; border-radius: 999px; padding: 12px 18px; background: #20201e; color: white; font: inherit; cursor: pointer; }
       .misplaced { margin-left: auto; background: #e96a45; border-color: #e96a45; }
-      .target { width: 190px; height: 62px; margin-top: 80px; border: 2px dashed #9ba668; border-radius: 12px; display: grid; place-items: center; color: #667328; }
+      .demo-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 70px; }
+      .card { min-height: 130px; padding: 18px; border: 1px solid #d0cbbc; border-radius: 14px; background: #f9f7ef; }
+      .card strong { display: block; margin-bottom: 8px; }
+      .card p { margin: 0; color: #716d64; font-size: 14px; line-height: 1.45; }
       .secret { margin-top: 42px; display: grid; gap: 6px; max-width: 320px; color: #64615a; font-size: 13px; }
       input { border: 1px solid #c8c3b6; border-radius: 8px; padding: 10px; background: white; }
+      @media (max-width: 720px) { .demo-grid { grid-template-columns: 1fr; } }
     </style>
   </head>
   <body>
@@ -27,12 +31,16 @@
     <main>
       <div class="eyebrow">A local feedback rendezvous</div>
       <h1>Point at the interface. Tell the agent what changes.</h1>
-      <p class="lead">Open the small N button, choose “Move this,” click the orange button, and then click the dashed destination.</p>
+      <p class="lead">Open the small N button. Add separate comments to this paragraph, a button, or any area. Use Draw to circle, underline, or handwrite directly on the page, then send everything together.</p>
       <div class="actions">
-        <button>Primary action</button>
-        <button id="misplaced-button" class="misplaced">I am in the wrong place</button>
+        <button id="primary-action">Start free</button>
+        <button class="misplaced">Why is this over here?</button>
       </div>
-      <div class="target">Move it here</div>
+      <section class="demo-grid" aria-label="Example feature cards">
+        <article class="card"><strong>Fast handoff</strong><p>The waiting command receives every numbered comment and the exact marked-up screenshot.</p></article>
+        <article class="card"><strong>Page-aware</strong><p>Element comments retain selectors, roles, accessible names, text, and their visible bounds.</p></article>
+        <article class="card"><strong>Local only</strong><p>The first version listens on loopback and accepts one capability-protected feedback batch.</p></article>
+      </section>
       <label class="secret">Sensitive input is masked in screenshots
         <input type="text" value="this value must not be captured">
       </label>

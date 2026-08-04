@@ -1,7 +1,13 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 pub const MAX_MESSAGE_CHARS: usize = 10_000;
+pub const MAX_COMMENT_CHARS: usize = 5_000;
+pub const MAX_COMMENTS: usize = 100;
+pub const MAX_DRAWING_STROKES: usize = 500;
+pub const MAX_DRAWING_POINTS: usize = 50_000;
 pub const MAX_SCREENSHOT_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -10,8 +16,10 @@ pub struct FeedbackSubmission {
     pub session_id: String,
     pub message: String,
     pub page: PageContext,
-    pub selection: Option<Selection>,
-    pub arrow: Option<Arrow>,
+    #[serde(default)]
+    pub comments: Vec<FeedbackComment>,
+    #[serde(default)]
+    pub drawings: Vec<DrawingStroke>,
     pub screenshot_data_url: String,
 }
 
@@ -31,6 +39,14 @@ pub struct Viewport {
     pub height: f64,
     pub scroll_x: f64,
     pub scroll_y: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FeedbackComment {
+    pub id: String,
+    pub message: String,
+    pub selection: Selection,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -75,9 +91,10 @@ pub struct Point {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct Arrow {
-    pub start: Point,
-    pub end: Point,
+pub struct DrawingStroke {
+    pub points: Vec<Point>,
+    pub color: String,
+    pub width: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -88,8 +105,8 @@ pub struct FeedbackManifest {
     pub session_id: String,
     pub message: String,
     pub page: PageContext,
-    pub selection: Option<Selection>,
-    pub arrow: Option<Arrow>,
+    pub comments: Vec<FeedbackComment>,
+    pub drawings: Vec<DrawingStroke>,
     pub screenshot_path: String,
     pub trust: TrustBoundary,
 }
@@ -108,8 +125,9 @@ pub struct FeedbackReceipt {
     pub status: &'static str,
     pub message: String,
     pub page_url: String,
-    pub selection_summary: Option<String>,
-    pub arrow_summary: Option<String>,
+    pub comment_count: usize,
+    pub drawing_stroke_count: usize,
+    pub comment_summaries: Vec<String>,
     pub manifest_path: String,
     pub screenshot_path: String,
 }
@@ -121,13 +139,21 @@ impl FeedbackSubmission {
         }
 
         self.message = self.message.trim().to_string();
-        if self.message.is_empty() {
-            return Err("feedback needs a message".into());
-        }
         if self.message.chars().count() > MAX_MESSAGE_CHARS {
             return Err(format!(
-                "feedback exceeds the {MAX_MESSAGE_CHARS}-character limit"
+                "the overall note exceeds the {MAX_MESSAGE_CHARS}-character limit"
             ));
+        }
+        if self.comments.len() > MAX_COMMENTS {
+            return Err(format!("feedback exceeds the {MAX_COMMENTS}-comment limit"));
+        }
+        if self.drawings.len() > MAX_DRAWING_STROKES {
+            return Err(format!(
+                "feedback exceeds the {MAX_DRAWING_STROKES}-stroke limit"
+            ));
+        }
+        if self.message.is_empty() && self.comments.is_empty() && self.drawings.is_empty() {
+            return Err("feedback needs an overall note, a comment, or a drawing".into());
         }
 
         let mut page_url = Url::parse(&self.page.url)
@@ -147,30 +173,45 @@ impl FeedbackSubmission {
             return Err("the device pixel ratio is outside the supported range".into());
         }
 
-        if let Some(selection) = &mut self.selection {
-            validate_rect(&selection.rect)?;
-            if let Some(element) = &mut selection.element {
-                element.tag = truncate(&element.tag.to_ascii_lowercase(), 80);
-                element.id = element.id.take().map(|value| truncate(&value, 200));
-                element.classes = element
-                    .classes
-                    .iter()
-                    .take(20)
-                    .map(|value| truncate(value, 120))
-                    .collect();
-                element.role = element.role.take().map(|value| truncate(&value, 120));
-                element.accessible_name = element
-                    .accessible_name
-                    .take()
-                    .map(|value| truncate(&value, 300));
-                element.text = element.text.take().map(|value| truncate(&value, 500));
-                element.selector = truncate(&element.selector, 1_000);
+        let mut comment_ids = HashSet::new();
+        for comment in &mut self.comments {
+            comment.id = truncate(comment.id.trim(), 100);
+            if comment.id.is_empty() || !comment_ids.insert(comment.id.clone()) {
+                return Err("every comment needs a unique non-empty id".into());
             }
+            comment.message = comment.message.trim().to_string();
+            if comment.message.is_empty() {
+                return Err("every selected item or area needs a comment".into());
+            }
+            if comment.message.chars().count() > MAX_COMMENT_CHARS {
+                return Err(format!(
+                    "a comment exceeds the {MAX_COMMENT_CHARS}-character limit"
+                ));
+            }
+            sanitize_selection(&mut comment.selection)?;
         }
 
-        if let Some(arrow) = &self.arrow {
-            validate_point(&arrow.start)?;
-            validate_point(&arrow.end)?;
+        let mut point_count = 0usize;
+        for stroke in &mut self.drawings {
+            if stroke.points.is_empty() {
+                return Err("drawing strokes cannot be empty".into());
+            }
+            point_count = point_count.saturating_add(stroke.points.len());
+            if point_count > MAX_DRAWING_POINTS {
+                return Err(format!(
+                    "feedback exceeds the {MAX_DRAWING_POINTS}-drawing-point limit"
+                ));
+            }
+            for point in &stroke.points {
+                validate_point(point)?;
+            }
+            if !stroke.width.is_finite() || !(0.5..=32.0).contains(&stroke.width) {
+                return Err("a drawing stroke has an unsupported width".into());
+            }
+            if !is_hex_color(&stroke.color) {
+                return Err("a drawing stroke has an unsupported color".into());
+            }
+            stroke.color.make_ascii_lowercase();
         }
 
         if !self
@@ -181,6 +222,16 @@ impl FeedbackSubmission {
         }
 
         Ok(self)
+    }
+}
+
+impl FeedbackComment {
+    pub fn summary(&self, number: usize) -> String {
+        format!(
+            "{number}. \"{}\" on {}",
+            truncate(&self.message, 160),
+            self.selection.summary()
+        )
     }
 }
 
@@ -207,13 +258,26 @@ impl Selection {
     }
 }
 
-impl Arrow {
-    pub fn summary(&self) -> String {
-        format!(
-            "from ({:.0}, {:.0}) to ({:.0}, {:.0})",
-            self.start.x, self.start.y, self.end.x, self.end.y
-        )
+fn sanitize_selection(selection: &mut Selection) -> Result<(), String> {
+    validate_rect(&selection.rect)?;
+    if let Some(element) = &mut selection.element {
+        element.tag = truncate(&element.tag.to_ascii_lowercase(), 80);
+        element.id = element.id.take().map(|value| truncate(&value, 200));
+        element.classes = element
+            .classes
+            .iter()
+            .take(20)
+            .map(|value| truncate(value, 120))
+            .collect();
+        element.role = element.role.take().map(|value| truncate(&value, 120));
+        element.accessible_name = element
+            .accessible_name
+            .take()
+            .map(|value| truncate(&value, 300));
+        element.text = element.text.take().map(|value| truncate(&value, 500));
+        element.selector = truncate(&element.selector, 1_000);
     }
+    Ok(())
 }
 
 fn validate_viewport(viewport: &Viewport) -> Result<(), String> {
@@ -236,11 +300,11 @@ fn validate_viewport(viewport: &Viewport) -> Result<(), String> {
 fn validate_rect(rect: &Rect) -> Result<(), String> {
     for value in [rect.x, rect.y, rect.width, rect.height] {
         if !value.is_finite() || value.abs() > 1_000_000.0 {
-            return Err("the selection contains an invalid coordinate".into());
+            return Err("a comment selection contains an invalid coordinate".into());
         }
     }
     if rect.width <= 0.0 || rect.height <= 0.0 {
-        return Err("the selection must have positive dimensions".into());
+        return Err("a comment selection must have positive dimensions".into());
     }
     Ok(())
 }
@@ -251,9 +315,15 @@ fn validate_point(point: &Point) -> Result<(), String> {
         || point.x.abs() > 1_000_000.0
         || point.y.abs() > 1_000_000.0
     {
-        return Err("the arrow contains an invalid coordinate".into());
+        return Err("a drawing stroke contains an invalid coordinate".into());
     }
     Ok(())
+}
+
+fn is_hex_color(value: &str) -> bool {
+    value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|value| value.is_ascii_hexdigit())
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -264,10 +334,31 @@ fn truncate(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    fn selection() -> Selection {
+        Selection {
+            kind: SelectionKind::Element,
+            rect: Rect {
+                x: 100.0,
+                y: 50.0,
+                width: 180.0,
+                height: 44.0,
+            },
+            element: Some(ElementContext {
+                tag: "BUTTON".into(),
+                id: Some("save".into()),
+                classes: vec!["primary".into()],
+                role: Some("button".into()),
+                accessible_name: Some("Save".into()),
+                text: Some("Save".into()),
+                selector: "#save".into(),
+            }),
+        }
+    }
+
     fn submission() -> FeedbackSubmission {
         FeedbackSubmission {
             session_id: "session".into(),
-            message: "  Move this button  ".into(),
+            message: "  Overall thought  ".into(),
             page: PageContext {
                 url: "http://localhost:5173/example?token=secret#section".into(),
                 title: "Example".into(),
@@ -279,17 +370,38 @@ mod tests {
                 },
                 device_pixel_ratio: 2.0,
             },
-            selection: None,
-            arrow: None,
+            comments: vec![FeedbackComment {
+                id: "comment-1".into(),
+                message: "  Make this clearer  ".into(),
+                selection: selection(),
+            }],
+            drawings: vec![DrawingStroke {
+                points: vec![Point { x: 1.0, y: 2.0 }, Point { x: 3.0, y: 4.0 }],
+                color: "#DC5835".into(),
+                width: 4.0,
+            }],
             screenshot_data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
         }
     }
 
     #[test]
-    fn sanitizes_message_and_url() {
+    fn sanitizes_batched_feedback_and_url() {
         let value = submission().validate_and_sanitize("session").unwrap();
-        assert_eq!(value.message, "Move this button");
+        assert_eq!(value.message, "Overall thought");
         assert_eq!(value.page.url, "http://localhost:5173/example");
+        assert_eq!(value.comments[0].message, "Make this clearer");
+        assert_eq!(
+            value.comments[0].selection.element.as_ref().unwrap().tag,
+            "button"
+        );
+        assert_eq!(value.drawings[0].color, "#dc5835");
+    }
+
+    #[test]
+    fn accepts_comments_without_an_overall_note() {
+        let mut value = submission();
+        value.message.clear();
+        assert!(value.validate_and_sanitize("session").is_ok());
     }
 
     #[test]
@@ -299,9 +411,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_feedback() {
+    fn rejects_completely_empty_feedback() {
         let mut value = submission();
-        value.message = "  ".into();
+        value.message.clear();
+        value.comments.clear();
+        value.drawings.clear();
+        assert!(value.validate_and_sanitize("session").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_comment_ids() {
+        let mut value = submission();
+        value.comments.push(value.comments[0].clone());
         assert!(value.validate_and_sanitize("session").is_err());
     }
 }
