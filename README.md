@@ -25,7 +25,7 @@ In another terminal:
 cargo run -- wait --origin http://localhost:5173 --json
 ```
 
-Open `http://localhost:5173` and click the small message icon. The dock expands to the left with icon-only tools; hover an icon to see its label. Choose the sticky-note tool, then click an element or empty point, or drag around an area. Write the note in the card that appears beside the target and save it. Drag any card by its header, or use its edit and delete icons. Use the pencil for freehand ink, the pointer or rectangular-selection tool to select ink, and the trash icon to remove selected strokes. Undo and redo cover notes, ink, card moves, and the page-level comment. Use the screenshot icon to review everything, then send it. The waiting command exits with a receipt like:
+Open `http://localhost:5173` and click the small message icon. The dock expands to the left and the launcher becomes the primary send button. Choose the sticky-note tool, then click an element or empty point, or drag around an area. Write the note in the card that appears beside the target and save it. Drag any card by its header, double-click its text to edit it, or use its trash icon to delete it. Use the pencil for freehand ink, the pointer or rectangular-selection tool to select ink, and the toolbar trash icon to remove selected strokes. Undo and redo cover notes, ink, card moves, and the page-level comment. Click the primary send button to capture the annotated page, submit the whole batch, and complete the waiting command.
 
 ```json
 {
@@ -80,7 +80,7 @@ Every bundle contains:
 - A batch of numbered sticky notes, each with its saved card position and optionally attached to an element or rectangular area.
 - Element metadata for comment targets: tag, role, accessible name, bounded text, classes, selector, and rectangle.
 - Freehand drawing strokes as bounded point sequences with stable IDs for selection and deletion.
-- The exact annotated screenshot previewed before sending.
+- The annotated screenshot captured when the user sends the batch.
 
 Place a free-floating sticky next to a circle, underline, or handwritten mark when the note is about your drawing rather than a DOM element. Saved stickies remain visible, movable, and editable while the toolbar is open.
 
@@ -110,6 +110,7 @@ The command deliberately completes after one feedback batch. A higher-level agen
 
 ```sh
 npm --prefix web ci
+npm --prefix web test
 npm --prefix web run build
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings

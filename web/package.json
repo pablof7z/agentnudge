@@ -4,7 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/widget.js --bundle --format=iife --target=es2020 --loader:.svg=text --minify --legal-comments=inline --outfile=dist/widget.js"
+    "build": "esbuild src/widget.js --bundle --format=iife --target=es2020 --loader:.svg=text --minify --legal-comments=inline --outfile=dist/widget.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@tabler/icons": "^3.46.0",

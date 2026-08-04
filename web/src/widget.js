@@ -1,15 +1,13 @@
 import html2canvas from "html2canvas";
+import { paintAnnotationOverlay } from "./annotation-overlay.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
-import iconDots from "@tabler/icons/outline/dots.svg";
-import iconEdit from "@tabler/icons/outline/edit.svg";
+import iconGrip from "@tabler/icons/outline/grip-horizontal.svg";
 import iconMessage from "@tabler/icons/outline/message-dots.svg";
 import iconNote from "@tabler/icons/outline/note.svg";
 import iconPencil from "@tabler/icons/outline/pencil.svg";
-import iconReview from "@tabler/icons/outline/photo-check.svg";
 import iconPointer from "@tabler/icons/outline/pointer.svg";
-import iconQuote from "@tabler/icons/outline/quote.svg";
 import iconSelect from "@tabler/icons/outline/select.svg";
 import iconSend from "@tabler/icons/outline/send.svg";
 import iconTrash from "@tabler/icons/outline/trash.svg";
@@ -35,8 +33,10 @@ const css = String.raw`
     --accent: #dc5835;
     --accent-soft: #fbe5dd;
     --selection: #2563c7;
-    --sticky: #fff4b8;
-    --sticky-border: #c6a946;
+    --sticky: #fffef9;
+    --sticky-text: #27251f;
+    --sticky-muted: #777267;
+    --sticky-hover: #f1eee6;
     all: initial;
     position: fixed;
     inset: auto 18px 18px auto;
@@ -56,8 +56,6 @@ const css = String.raw`
       --muted: #b8b5ac;
       --border: #4c4d48;
       --accent-soft: #593126;
-      --sticky: #4a421f;
-      --sticky-border: #8f7a30;
     }
   }
 
@@ -74,7 +72,7 @@ const css = String.raw`
   }
 
   .tray {
-    width: min(334px, calc(100vw - 78px));
+    width: min(300px, calc(100vw - 78px));
     border: 1px solid var(--border);
     border-radius: 13px;
     background: color-mix(in srgb, var(--surface) 94%, transparent);
@@ -130,7 +128,7 @@ const css = String.raw`
     outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent);
     outline-offset: 2px;
   }
-  .icon-button svg, .launcher svg, .general-icon svg, .sticky-icon svg { width: 19px; height: 19px; display: block; }
+  .icon-button svg, .launcher svg, .sticky-icon svg { width: 19px; height: 19px; display: block; }
 
   .launcher {
     width: 42px;
@@ -141,35 +139,37 @@ const css = String.raw`
     color: var(--text);
     box-shadow: 0 4px 16px rgb(20 20 18 / .18);
   }
+  .launcher[data-primary="true"] {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: #fffaf5;
+  }
+  .launcher:disabled { cursor: default; opacity: .72; }
   .launcher svg { transition: transform 220ms cubic-bezier(.2, .8, .2, 1); }
-  .dock[data-open="true"] .launcher svg { transform: rotate(-12deg) scale(.92); }
+  .dock[data-open="true"] .launcher svg { transform: translateX(1px) rotate(-8deg) scale(.94); }
 
   .general-note {
-    display: grid;
-    grid-template-columns: 28px minmax(0, 1fr);
-    align-items: start;
-    gap: 2px;
     border-top: 1px solid var(--border);
-    padding: 5px 8px 7px;
+    padding: 5px 9px 7px;
   }
-  .general-icon { height: 26px; display: grid; place-items: center; color: var(--muted); }
   .general-note textarea {
     display: block;
     width: 100%;
     height: 26px;
     min-height: 26px;
-    max-height: 96px;
+    max-height: min(42dvh, 320px);
     resize: none;
     overflow: hidden;
     border: 0;
     border-radius: 0;
-    padding: 3px 2px;
+    padding: 3px 4px;
     background: transparent;
     color: var(--text);
     line-height: 20px;
-    transition: height 180ms ease;
+    transition: background-color 160ms ease;
   }
-  .general-note textarea:focus { overflow-y: auto; }
+  .general-note textarea::placeholder { color: var(--muted); opacity: .82; }
+  .general-note textarea:focus { background: color-mix(in srgb, var(--surface-hover) 55%, transparent); }
 
   .sr-only {
     position: absolute;
@@ -203,62 +203,52 @@ const css = String.raw`
   .sticky-layer { position: absolute; inset: 0; pointer-events: none; }
   .sticky-card {
     position: fixed;
-    width: min(230px, calc(100vw - 24px));
-    padding: 9px 10px 10px;
-    border: 1px solid var(--sticky-border);
-    border-radius: 9px;
+    left: 0;
+    top: 0;
+    width: min(248px, calc(100vw - 24px));
+    padding: 10px 11px 12px;
+    border: 0;
+    border-radius: 12px;
     background: var(--sticky);
-    color: var(--text);
-    box-shadow: 0 5px 18px rgb(45 38 10 / .18);
+    color: var(--sticky-text);
+    box-shadow: 0 12px 34px rgb(54 45 28 / .16), 0 0 0 1px rgb(76 67 49 / .12);
     pointer-events: auto;
+    will-change: transform;
   }
   .sticky-head {
     display: flex;
     align-items: center;
     gap: 6px;
     min-height: 24px;
-    margin: -3px -3px 5px;
-    padding: 3px;
+    margin: -4px -5px 6px;
+    padding: 4px 5px;
     cursor: grab;
     touch-action: none;
   }
   .sticky-head:active { cursor: grabbing; }
   .sticky-number { width: 22px; height: 22px; display: grid; place-items: center; flex: none; border-radius: 50%; background: var(--accent); color: #fffaf5; font-size: 11px; font-weight: 800; }
-  .sticky-target { min-width: 0; flex: 1; color: color-mix(in srgb, var(--text) 68%, transparent); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sticky-icon { width: 25px; height: 25px; display: grid; place-items: center; flex: none; border: 0; border-radius: 6px; padding: 0; background: transparent; color: color-mix(in srgb, var(--text) 66%, transparent); cursor: pointer; }
-  .sticky-icon:hover { background: color-mix(in srgb, var(--text) 9%, transparent); color: var(--text); }
+  .sticky-target { min-width: 0; flex: 1; color: var(--sticky-muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sticky-icon { width: 26px; height: 26px; display: grid; place-items: center; flex: none; border: 0; border-radius: 7px; padding: 0; background: transparent; color: var(--sticky-muted); cursor: pointer; }
+  .sticky-icon:hover { background: var(--sticky-hover); color: var(--sticky-text); }
   .sticky-icon svg { width: 16px; height: 16px; }
-  .sticky-message { font-size: 12px; line-height: 1.42; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .sticky-grip { cursor: grab; }
+  .sticky-message { min-height: 22px; padding: 2px 1px; font-size: 13px; line-height: 1.46; overflow-wrap: anywhere; white-space: pre-wrap; cursor: text; user-select: text; }
   .sticky-card textarea {
     display: block;
     width: 100%;
-    min-height: 82px;
-    resize: vertical;
+    min-height: 54px;
+    max-height: min(42dvh, 320px);
+    resize: none;
     border: 0;
     border-radius: 6px;
     padding: 7px 8px;
-    background: color-mix(in srgb, var(--surface-raised) 76%, transparent);
-    color: var(--text);
-    line-height: 1.4;
+    background: var(--sticky-hover);
+    color: var(--sticky-text);
+    line-height: 1.46;
   }
   .sticky-card[data-error="true"] textarea { outline: 2px solid var(--accent); }
-  .sticky-actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: 6px; }
-
-  .review-popover {
-    position: fixed;
-    right: 18px;
-    bottom: 72px;
-    width: min(360px, calc(100vw - 36px));
-    padding: 8px;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    background: var(--surface);
-    box-shadow: 0 14px 44px rgb(20 20 18 / .24);
-    z-index: 2;
-  }
-  .review-popover[hidden] { display: none; }
-  .review-popover img { display: block; width: 100%; max-height: min(62vh, 520px); object-fit: contain; border-radius: 7px; background: var(--surface-hover); }
-  .review-actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: 6px; }
+  .sticky-actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: 7px; }
+  .sticky-actions .sticky-icon:last-child { background: var(--sticky-text); color: var(--sticky); }
 
   @media (prefers-reduced-motion: reduce) {
     .tray, .launcher svg, .icon-button, .general-note textarea { transition: none; }
@@ -288,6 +278,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.currentStroke = null;
     this.preview = null;
     this.suppressNextClick = false;
+    this.movingSticky = false;
     this.sent = false;
     this.abort = new AbortController();
 
@@ -305,12 +296,9 @@ class AgentNudgeWidget extends HTMLElement {
             ${iconButtonMarkup("undo", "Undo", iconUndo)}
             ${iconButtonMarkup("redo", "Redo", iconRedo)}
             ${iconButtonMarkup("delete-selection", "Delete selected drawing", iconTrash)}
-            <span class="separator" aria-hidden="true"></span>
-            ${iconButtonMarkup("review", "Review feedback", iconReview)}
           </div>
           <div class="general-note">
-            <span class="general-icon" title="General comment" aria-hidden="true">${iconQuote}</span>
-            <textarea rows="1" maxlength="10000" aria-label="General comment" title="General comment"></textarea>
+            <textarea rows="1" maxlength="10000" aria-label="General comment" placeholder="General comment"></textarea>
           </div>
         </section>
         <button class="launcher" type="button" aria-label="Open annotation toolbar" aria-expanded="false" title="Open annotation toolbar">${iconMessage}</button>
@@ -324,13 +312,6 @@ class AgentNudgeWidget extends HTMLElement {
         </svg>
         <div class="sticky-layer"></div>
       </div>
-      <section class="review-popover" aria-label="Feedback screenshot preview" hidden>
-        <img alt="Annotated screenshot to send to the waiting agent">
-        <div class="review-actions">
-          ${iconButtonMarkup("close-review", "Close preview", iconX)}
-          ${iconButtonMarkup("send", "Send all feedback", iconSend, "primary")}
-        </div>
-      </section>
       <p class="status sr-only" aria-live="polite"></p>
     `;
 
@@ -344,13 +325,11 @@ class AgentNudgeWidget extends HTMLElement {
     this.annotationLayer = root.querySelector(".annotation-layer");
     this.drawingLayer = root.querySelector(".drawing-layer");
     this.stickyLayer = root.querySelector(".sticky-layer");
-    this.reviewPopover = root.querySelector(".review-popover");
-    this.previewImage = root.querySelector(".review-popover img");
   }
 
   connectedCallback() {
     const signal = this.abort.signal;
-    this.launcher.addEventListener("click", () => this.toggleDock(), { signal });
+    this.launcher.addEventListener("click", () => this.onLauncherClick(), { signal });
     this.root.querySelector(".select-mode").addEventListener("click", () => this.setMode("select"), { signal });
     this.root.querySelector(".sticky-mode").addEventListener("click", () => this.setMode("sticky"), { signal });
     this.root.querySelector(".draw-mode").addEventListener("click", () => this.setMode("draw"), { signal });
@@ -358,9 +337,6 @@ class AgentNudgeWidget extends HTMLElement {
     this.root.querySelector(".undo").addEventListener("click", () => this.undo(), { signal });
     this.root.querySelector(".redo").addEventListener("click", () => this.redo(), { signal });
     this.root.querySelector(".delete-selection").addEventListener("click", () => this.deleteSelectedStrokes(), { signal });
-    this.root.querySelector(".review").addEventListener("click", () => this.makePreview(), { signal });
-    this.root.querySelector(".close-review").addEventListener("click", () => this.closePreview(), { signal });
-    this.root.querySelector(".send").addEventListener("click", () => this.send(), { signal });
 
     this.general.addEventListener("focus", () => this.beginGeneralEdit(), { signal });
     this.general.addEventListener("input", () => this.onGeneralInput(), { signal });
@@ -385,8 +361,15 @@ class AgentNudgeWidget extends HTMLElement {
     this.opened = !this.opened;
     this.mode = this.opened ? "select" : "idle";
     this.cancelTransientEditors();
-    this.closePreview();
     this.render();
+  }
+
+  onLauncherClick() {
+    if (!this.opened) {
+      this.toggleDock();
+      return;
+    }
+    this.send();
   }
 
   setMode(mode) {
@@ -402,7 +385,6 @@ class AgentNudgeWidget extends HTMLElement {
     this.dragStart = null;
     this.pointerTarget = null;
     if (!["select", "region"].includes(mode)) this.selectedStrokeIds.clear();
-    this.closePreview();
     this.invalidatePreview();
     this.render();
   }
@@ -427,12 +409,11 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   autoSizeGeneral() {
-    if (this.root.activeElement === this.general) {
-      this.general.style.height = "26px";
-      this.general.style.height = `${Math.min(96, Math.max(52, this.general.scrollHeight))}px`;
-    } else {
-      this.general.style.height = "26px";
-    }
+    const maximum = Math.min(320, window.innerHeight * .42);
+    this.general.style.height = "26px";
+    const height = Math.min(maximum, Math.max(26, this.general.scrollHeight));
+    this.general.style.height = `${height}px`;
+    this.general.style.overflowY = this.general.scrollHeight > maximum ? "auto" : "hidden";
   }
 
   onPointerDown(event) {
@@ -492,6 +473,7 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   onPointerMove(event) {
+    if (event.composedPath().includes(this) || this.movingSticky) return;
     const point = { x: event.clientX, y: event.clientY };
     if (this.mode === "draw" && this.currentStroke) {
       event.preventDefault();
@@ -510,14 +492,14 @@ class AgentNudgeWidget extends HTMLElement {
         this.hoverRect = null;
         this.pendingRect = rectFromPoints(this.dragStart, point);
       }
-      this.renderOverlay();
+      this.renderGuides();
       return;
     }
 
     if (this.mode === "sticky" && !this.dragStart) {
       const target = event.target instanceof Element ? meaningfulTarget(event.target) : null;
       this.hoverRect = target ? plainRect(target.getBoundingClientRect()) : null;
-      this.renderOverlay();
+      this.renderGuides();
     }
   }
 
@@ -620,7 +602,10 @@ class AgentNudgeWidget extends HTMLElement {
       this.cancelEditComment();
     } else if (this.opened) {
       event.preventDefault();
-      this.setMode("select");
+      this.opened = false;
+      this.mode = "idle";
+      this.selectedStrokeIds.clear();
+      this.render();
     }
   }
 
@@ -697,36 +682,15 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   beginStickyDrag(event, comment, card) {
-    if (event.target.closest("button")) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const pointerId = event.pointerId;
-    const start = { x: event.clientX, y: event.clientY };
-    const origin = { ...comment.cardPosition };
+    if (event.target.closest("button") || this.editingCommentId === comment.id) return;
     const before = this.snapshot();
-    let moved = false;
-    card.setPointerCapture(pointerId);
-
-    const move = (moveEvent) => {
-      const dx = moveEvent.clientX - start.x;
-      const dy = moveEvent.clientY - start.y;
-      if (Math.hypot(dx, dy) > 2) moved = true;
-      const position = clampCardPosition({ x: origin.x + dx, y: origin.y + dy });
+    this.trackCardDrag(event, card, comment.cardPosition, (position) => {
       comment.cardPosition = position;
-      card.style.left = `${position.x}px`;
-      card.style.top = `${position.y}px`;
       this.invalidatePreview();
-    };
-    const up = () => {
-      card.removeEventListener("pointermove", move);
-      card.removeEventListener("pointerup", up);
-      card.removeEventListener("pointercancel", up);
+    }, (moved) => {
       if (moved) this.pushUndoSnapshot(before);
       this.renderHistoryButtons();
-    };
-    card.addEventListener("pointermove", move);
-    card.addEventListener("pointerup", up);
-    card.addEventListener("pointercancel", up);
+    });
   }
 
   deleteSelectedStrokes() {
@@ -820,46 +784,12 @@ class AgentNudgeWidget extends HTMLElement {
       this.draft.selection.rect = plainRect(this.draft.element.getBoundingClientRect());
     }
     this.invalidatePreview();
-    this.renderOverlay();
+    this.renderGuides();
+    this.renderAnnotationLayer();
   }
 
   invalidatePreview() {
     this.preview = null;
-    this.reviewPopover.hidden = true;
-  }
-
-  closePreview() {
-    this.reviewPopover.hidden = true;
-  }
-
-  async makePreview() {
-    if (this.sent) return;
-    if (this.draft || this.editingCommentId) {
-      this.setStatus("Finish the open sticky note first.");
-      this.focusStickyEditor();
-      return;
-    }
-    if (!this.general.value.trim() && this.comments.length === 0 && this.strokes.length === 0) {
-      this.setStatus("Add feedback before reviewing.");
-      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
-        this.dock.animate([{ transform: "translateX(0)" }, { transform: "translateX(-4px)" }, { transform: "translateX(0)" }], { duration: 180 });
-      }
-      return;
-    }
-    const button = this.root.querySelector(".review");
-    button.disabled = true;
-    try {
-      const screenshotDataUrl = await this.captureScreenshot();
-      this.preview = this.buildPayload(screenshotDataUrl);
-      this.previewImage.src = screenshotDataUrl;
-      this.reviewPopover.hidden = false;
-      this.setStatus("Feedback preview ready.");
-    } catch (error) {
-      console.error("AgentNudge screenshot failed", error);
-      this.setStatus("The page could not be captured.");
-    } finally {
-      button.disabled = false;
-    }
   }
 
   async captureScreenshot() {
@@ -895,15 +825,16 @@ class AgentNudgeWidget extends HTMLElement {
     });
 
     const context = canvas.getContext("2d");
-    const scaleX = canvas.width / window.innerWidth;
-    const scaleY = canvas.height / window.innerHeight;
-    context.save();
-    context.scale(scaleX, scaleY);
-    this.strokes.forEach((stroke) => drawStroke(context, stroke));
-    this.comments.forEach((comment, index) => {
-      drawSticky(context, comment, this.currentCommentRect(comment), comment.cardPosition, index + 1);
+    paintAnnotationOverlay({
+      context,
+      canvas,
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      strokes: this.strokes,
+      comments: this.comments,
+      resolveCommentRect: (comment) => this.currentCommentRect(comment),
+      paintStroke: drawStroke,
+      paintSticky: drawSticky,
     });
-    context.restore();
     return canvas.toDataURL("image/png");
   }
 
@@ -939,10 +870,19 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   async send() {
-    if (!this.preview || this.sent) return;
-    const button = this.root.querySelector(".send");
-    button.disabled = true;
+    if (this.sent || !this.finishEditorsForSend()) return;
+    if (!this.general.value.trim() && this.comments.length === 0 && this.strokes.length === 0) {
+      this.setStatus("Add feedback before sending.");
+      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        this.dock.animate([{ transform: "translateX(0)" }, { transform: "translateX(-4px)" }, { transform: "translateX(0)" }], { duration: 180 });
+      }
+      return;
+    }
+    this.launcher.disabled = true;
+    this.setStatus("Capturing feedback.");
     try {
+      const screenshotDataUrl = await this.captureScreenshot();
+      this.preview = this.buildPayload(screenshotDataUrl);
       const response = await fetch(`${ENDPOINT}/submit`, {
         method: "POST",
         mode: "cors",
@@ -956,14 +896,33 @@ class AgentNudgeWidget extends HTMLElement {
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
       this.sent = true;
-      this.reviewPopover.hidden = true;
       this.setStatus("Feedback sent.");
       this.render();
     } catch (error) {
       console.error("AgentNudge submission failed", error);
       this.setStatus("Feedback could not be sent.");
-      button.disabled = false;
+      this.launcher.disabled = false;
     }
+  }
+
+  finishEditorsForSend() {
+    if (this.draft) {
+      if (!this.draft.message.trim()) {
+        this.setStatus("Write the open sticky note before sending.");
+        this.focusStickyEditor();
+        return false;
+      }
+      this.saveDraft(this.draft.message);
+    }
+    if (this.editingCommentId) {
+      if (!this.editingMessage.trim()) {
+        this.setStatus("A sticky note cannot be empty.");
+        this.focusStickyEditor();
+        return false;
+      }
+      this.saveEditComment(this.editingCommentId, this.editingMessage);
+    }
+    return true;
   }
 
   focusStickyEditor() {
@@ -977,9 +936,13 @@ class AgentNudgeWidget extends HTMLElement {
 
   render() {
     this.dock.dataset.open = String(this.opened);
+    this.launcher.dataset.primary = String(this.opened);
+    this.launcher.innerHTML = this.sent ? iconCheck : (this.opened ? iconSend : iconMessage);
+    const launcherLabel = this.sent ? "Feedback sent" : (this.opened ? "Send feedback" : "Open annotation toolbar");
     this.launcher.setAttribute("aria-expanded", String(this.opened));
-    this.launcher.setAttribute("aria-label", this.opened ? "Close annotation toolbar" : "Open annotation toolbar");
-    this.launcher.title = this.opened ? "Close annotation toolbar" : "Open annotation toolbar";
+    this.launcher.setAttribute("aria-label", launcherLabel);
+    this.launcher.title = launcherLabel;
+    this.launcher.disabled = this.sent;
     for (const mode of ["select", "sticky", "draw", "region"]) {
       const button = this.root.querySelector(`.${mode}-mode`);
       button.dataset.active = String(this.mode === mode);
@@ -989,6 +952,7 @@ class AgentNudgeWidget extends HTMLElement {
       if (!button.matches(".undo, .redo, .delete-selection")) button.disabled = this.sent;
     });
     this.general.disabled = this.sent;
+    this.autoSizeGeneral();
     this.renderHistoryButtons();
     this.renderOverlay();
   }
@@ -1000,12 +964,16 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   renderOverlay() {
-    setRect(this.hoverBox, this.hoverRect, Boolean(this.hoverRect));
-    setRect(this.pendingBox, this.pendingRect, Boolean(this.pendingRect));
+    this.renderGuides();
     this.renderAnnotationLayer();
     this.renderDrawingLayer();
     this.renderStickyLayer();
     this.renderHistoryButtons();
+  }
+
+  renderGuides() {
+    setRect(this.hoverBox, this.hoverRect, Boolean(this.hoverRect));
+    setRect(this.pendingBox, this.pendingRect, Boolean(this.pendingRect));
   }
 
   renderAnnotationLayer() {
@@ -1062,40 +1030,46 @@ class AgentNudgeWidget extends HTMLElement {
     const card = baseStickyCard(number, selectionLabel(comment.selection), comment.cardPosition);
     const head = card.querySelector(".sticky-head");
     const grip = document.createElement("span");
-    grip.className = "sticky-icon";
+    grip.className = "sticky-icon sticky-grip";
     grip.setAttribute("aria-hidden", "true");
-    grip.innerHTML = iconDots;
+    grip.innerHTML = iconGrip;
     head.append(grip);
 
     if (!editing) {
-      const edit = createIconButton("Edit sticky", iconEdit, "sticky-icon");
-      edit.addEventListener("pointerdown", (event) => event.stopPropagation());
-      edit.addEventListener("click", () => this.startEditComment(comment));
       const remove = createIconButton("Delete sticky", iconTrash, "sticky-icon");
       remove.addEventListener("pointerdown", (event) => event.stopPropagation());
       remove.addEventListener("click", () => this.removeComment(comment.id));
-      head.append(edit, remove);
+      head.append(remove);
       const copy = document.createElement("div");
       copy.className = "sticky-message";
       copy.textContent = comment.message;
+      copy.title = "Double-click to edit";
+      copy.addEventListener("dblclick", (event) => {
+        event.stopPropagation();
+        this.startEditComment(comment);
+      });
       card.append(copy);
     } else {
       const textarea = document.createElement("textarea");
       textarea.maxLength = 5000;
       textarea.value = this.editingMessage;
       textarea.setAttribute("aria-label", "Edit sticky note");
-      textarea.addEventListener("input", () => { this.editingMessage = textarea.value; });
-      textarea.addEventListener("keydown", (event) => {
-        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") this.saveEditComment(comment.id, textarea.value);
+      textarea.addEventListener("input", () => {
+        this.editingMessage = textarea.value;
+        autoSizeTextarea(textarea);
       });
-      const actions = document.createElement("div");
-      actions.className = "sticky-actions";
-      const cancel = createIconButton("Cancel editing", iconX, "sticky-icon");
-      cancel.addEventListener("click", () => this.cancelEditComment());
-      const save = createIconButton("Save sticky", iconCheck, "sticky-icon");
-      save.addEventListener("click", () => this.saveEditComment(comment.id, textarea.value));
-      actions.append(cancel, save);
-      card.append(textarea, actions);
+      textarea.addEventListener("blur", () => {
+        if (textarea.value.trim()) this.saveEditComment(comment.id, textarea.value);
+        else this.cancelEditComment();
+      }, { once: true });
+      textarea.addEventListener("keydown", (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          event.preventDefault();
+          textarea.blur();
+        }
+      });
+      card.append(textarea);
+      queueMicrotask(() => autoSizeTextarea(textarea));
     }
 
     head.addEventListener("pointerdown", (event) => this.beginStickyDrag(event, comment, card));
@@ -1108,9 +1082,9 @@ class AgentNudgeWidget extends HTMLElement {
     card.dataset.error = String(Boolean(this.draft.error));
     const head = card.querySelector(".sticky-head");
     const grip = document.createElement("span");
-    grip.className = "sticky-icon";
+    grip.className = "sticky-icon sticky-grip";
     grip.setAttribute("aria-hidden", "true");
-    grip.innerHTML = iconDots;
+    grip.innerHTML = iconGrip;
     head.append(grip);
     head.addEventListener("pointerdown", (event) => this.beginDraftDrag(event, card));
     const textarea = document.createElement("textarea");
@@ -1122,6 +1096,7 @@ class AgentNudgeWidget extends HTMLElement {
       this.draft.error = false;
       card.dataset.error = "false";
       this.invalidatePreview();
+      autoSizeTextarea(textarea);
     });
     textarea.addEventListener("keydown", (event) => {
       if ((event.metaKey || event.ctrlKey) && event.key === "Enter") this.saveDraft(textarea.value);
@@ -1134,37 +1109,54 @@ class AgentNudgeWidget extends HTMLElement {
     save.addEventListener("click", () => this.saveDraft(textarea.value));
     actions.append(cancel, save);
     card.append(textarea, actions);
+    queueMicrotask(() => autoSizeTextarea(textarea));
     return card;
   }
 
   beginDraftDrag(event, card) {
     if (event.target.closest("button")) return;
+    this.trackCardDrag(event, card, this.draft.cardPosition, (position) => {
+      this.draft.cardPosition = position;
+      this.invalidatePreview();
+    }, () => this.focusStickyEditor());
+  }
+
+  trackCardDrag(event, card, startPosition, onMove, onFinish) {
     event.preventDefault();
     event.stopPropagation();
     const pointerId = event.pointerId;
     const start = { x: event.clientX, y: event.clientY };
-    const origin = { ...this.draft.cardPosition };
-    card.setPointerCapture(pointerId);
+    const origin = { ...startPosition };
+    let moved = false;
+    let finished = false;
+    this.movingSticky = true;
+    card.dataset.dragging = "true";
 
     const move = (moveEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      const dx = moveEvent.clientX - start.x;
+      const dy = moveEvent.clientY - start.y;
+      if (Math.hypot(dx, dy) > 2) moved = true;
       const position = clampCardPosition({
-        x: origin.x + moveEvent.clientX - start.x,
-        y: origin.y + moveEvent.clientY - start.y,
+        x: origin.x + dx,
+        y: origin.y + dy,
       });
-      this.draft.cardPosition = position;
-      card.style.left = `${position.x}px`;
-      card.style.top = `${position.y}px`;
-      this.invalidatePreview();
+      onMove(position);
+      card.style.transform = `translate3d(${position.x}px, ${position.y}px, 0)`;
     };
-    const up = () => {
-      card.removeEventListener("pointermove", move);
-      card.removeEventListener("pointerup", up);
-      card.removeEventListener("pointercancel", up);
-      this.focusStickyEditor();
+    const up = (upEvent) => {
+      if (finished || upEvent.pointerId !== pointerId) return;
+      finished = true;
+      document.removeEventListener("pointermove", move, true);
+      document.removeEventListener("pointerup", up, true);
+      document.removeEventListener("pointercancel", up, true);
+      delete card.dataset.dragging;
+      this.movingSticky = false;
+      onFinish(moved);
     };
-    card.addEventListener("pointermove", move);
-    card.addEventListener("pointerup", up);
-    card.addEventListener("pointercancel", up);
+    document.addEventListener("pointermove", move, true);
+    document.addEventListener("pointerup", up, true);
+    document.addEventListener("pointercancel", up, true);
   }
 }
 
@@ -1185,8 +1177,7 @@ function createIconButton(label, svg, className = "icon-button") {
 function baseStickyCard(number, target, position) {
   const card = document.createElement("section");
   card.className = "sticky-card";
-  card.style.left = `${position.x}px`;
-  card.style.top = `${position.y}px`;
+  card.style.transform = `translate3d(${position.x}px, ${position.y}px, 0)`;
   const head = document.createElement("div");
   head.className = "sticky-head";
   const badge = document.createElement("span");
@@ -1317,7 +1308,7 @@ function strokePath(points) {
 }
 
 function placeSticky(position, rect) {
-  const width = Math.min(230, window.innerWidth - 24);
+  const width = Math.min(248, window.innerWidth - 24);
   const anchorX = rect ? rect.x + rect.width : position.x;
   let x = anchorX + 14;
   if (x + width > window.innerWidth - 12) x = (rect ? rect.x : position.x) - width - 14;
@@ -1325,7 +1316,7 @@ function placeSticky(position, rect) {
 }
 
 function clampCardPosition(position) {
-  const width = Math.min(230, window.innerWidth - 24);
+  const width = Math.min(248, window.innerWidth - 24);
   return {
     x: Math.max(12, Math.min(position.x, window.innerWidth - width - 12)),
     y: Math.max(12, Math.min(position.y, window.innerHeight - 100)),
@@ -1380,7 +1371,7 @@ function drawSticky(context, comment, rect, cardPosition, number) {
   const pinY = rect ? Math.max(13, rect.y + 4) : comment.position.y;
   context.save();
   if (rect) {
-    context.fillStyle = "rgb(220 88 53 / .09)";
+    context.fillStyle = "rgba(220, 88, 53, .09)";
     context.strokeStyle = INK_COLOR;
     context.lineWidth = 2;
     context.fillRect(rect.x, rect.y, rect.width, rect.height);
@@ -1399,16 +1390,20 @@ function drawSticky(context, comment, rect, cardPosition, number) {
   context.textBaseline = "middle";
   context.fillText(String(number), pinX, pinY + .5);
 
-  const cardWidth = Math.min(230, window.innerWidth - 24);
+  const cardWidth = Math.min(248, window.innerWidth - 24);
   const textWidth = cardWidth - 22;
   context.font = "12px ui-sans-serif, -apple-system, sans-serif";
   const lines = wrapCanvasText(context, comment.message, textWidth).slice(0, 18);
   const cardHeight = 45 + Math.max(1, lines.length) * 17;
-  context.fillStyle = "#fff4b8";
-  context.strokeStyle = "#c6a946";
+  context.shadowColor = "rgba(54, 45, 28, .16)";
+  context.shadowBlur = 22;
+  context.shadowOffsetY = 8;
+  context.fillStyle = "#fffef9";
+  context.strokeStyle = "#d8d3c7";
   context.lineWidth = 1;
   roundedRect(context, cardPosition.x, cardPosition.y, cardWidth, cardHeight, 9);
   context.fill();
+  context.shadowColor = "transparent";
   context.stroke();
   context.beginPath();
   context.arc(cardPosition.x + 22, cardPosition.y + 21, 11, 0, Math.PI * 2);
@@ -1417,11 +1412,19 @@ function drawSticky(context, comment, rect, cardPosition, number) {
   context.fillStyle = "#fffaf5";
   context.font = "800 11px ui-sans-serif, -apple-system, sans-serif";
   context.fillText(String(number), cardPosition.x + 22, cardPosition.y + 21.5);
-  context.fillStyle = "#292511";
+  context.fillStyle = "#27251f";
   context.font = "12px ui-sans-serif, -apple-system, sans-serif";
   context.textAlign = "left";
   lines.forEach((line, index) => context.fillText(line, cardPosition.x + 11, cardPosition.y + 42 + index * 17));
   context.restore();
+}
+
+function autoSizeTextarea(textarea) {
+  const maximum = Math.min(320, window.innerHeight * .42);
+  textarea.style.height = "54px";
+  const height = Math.min(maximum, Math.max(54, textarea.scrollHeight));
+  textarea.style.height = `${height}px`;
+  textarea.style.overflowY = textarea.scrollHeight > maximum ? "auto" : "hidden";
 }
 
 function drawStroke(context, stroke) {
