@@ -17,4 +17,6 @@ When changing the widget or broker, exercise the demo in a real browser with a s
 
 When changing session routing, create at least two simultaneous word sessions and prove that a message submitted to one cannot complete a wait on the other. End both sessions after the test.
 
+When changing execution, exercise a real direct-argv command, nonzero output, and process-group timeout. When changing browser control, use an explicitly armed demo session and prove a typed action round trip against a connected page, plus expiry and cross-session isolation.
+
 Do not add console logs, network requests, browser storage, full DOM, or form values to the feedback packet by default. Captured page content must remain bounded and explicitly untrusted.

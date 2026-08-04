@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use url::Url;
 
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 9;
 pub const MAX_MESSAGE_CHARS: usize = 10_000;
 pub const MAX_ATTACHMENTS: usize = 100;
 pub const MAX_DRAWING_STROKES: usize = 500;
@@ -12,6 +13,9 @@ pub const MAX_SCREENSHOT_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_REPLY_IMAGE_ATTACHMENTS: usize = 8;
 pub const MAX_REPLY_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_REPLY_IMAGE_TOTAL_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_BROWSER_SELECTOR_CHARS: usize = 2_000;
+pub const MAX_BROWSER_FILL_CHARS: usize = 10_000;
+pub const MAX_BROWSER_RESULT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -213,6 +217,112 @@ pub struct ReplyReceipt {
 pub struct TrustBoundary {
     pub page_content: String,
     pub note: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BrowserAction {
+    Snapshot,
+    Click {
+        selector: String,
+    },
+    Fill {
+        selector: String,
+        text: String,
+    },
+    Scroll {
+        selector: Option<String>,
+        x: Option<f64>,
+        y: Option<f64>,
+    },
+    WaitFor {
+        selector: String,
+    },
+    Navigate {
+        url: String,
+    },
+    Reload,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserActionRequest {
+    pub page_id: Option<String>,
+    pub action: BrowserAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPage {
+    pub page_id: String,
+    pub url: String,
+    pub title: String,
+    pub last_seen_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserPagesResponse {
+    pub version: u8,
+    pub status: String,
+    pub session: String,
+    pub pages: Vec<BrowserPage>,
+    pub trust: TrustBoundary,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCommand {
+    pub version: u8,
+    pub command_id: String,
+    pub session: String,
+    pub page_id: String,
+    pub expires_at_unix_ms: u64,
+    pub action: BrowserAction,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCommandPollResponse {
+    pub version: u8,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<BrowserCommand>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserCommandResultSubmission {
+    pub command_id: String,
+    pub page_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub value: Option<Value>,
+    pub error: Option<String>,
+    pub current_url: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserActionResponse {
+    pub version: u8,
+    pub status: String,
+    pub session: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub page_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub waited_ms: u64,
+    pub trust: TrustBoundary,
 }
 
 impl TrustBoundary {

@@ -1,6 +1,6 @@
 ---
 name: agentnudge
-description: Add and run AgentNudge visual feedback loops for local websites. Use when embedding the widget, waiting for annotated feedback, replying in-page, or iterating on UI with a person.
+description: Run AgentNudge feedback, bounded local commands, and connected-page control for development websites. Use when embedding the widget, waiting for visual feedback, replying in-page, executing project code, or operating the preview.
 ---
 
 # AgentNudge
@@ -11,8 +11,9 @@ AgentNudge connects a local website preview to the coding agent's active turn. A
 
 - Read [references/web-integration.md](references/web-integration.md) before adding the widget to a website, configuring a preview, or handling sensitive page content.
 - Read [references/feedback-loop.md](references/feedback-loop.md) before creating a session, waiting, replying, processing evidence, or ending a session.
+- Read [references/execution-and-browser-control.md](references/execution-and-browser-control.md) before running project commands or inspecting, clicking, filling, scrolling, waiting on, navigating, or reloading the connected preview.
 
-Read both when setting up a complete feedback loop from scratch.
+Read the first two for a complete feedback setup. Add the control reference only when executing code or operating the page.
 
 ## Work the loop
 

@@ -1,5 +1,11 @@
 import html2canvas from "html2canvas";
 import { paintMessageAttachments } from "./annotation-overlay.js";
+import {
+  browserCommandRequestUrl,
+  createPageId,
+  performBrowserAction,
+  safePageUrl,
+} from "./browser-control.js";
 import { replyImageLabel, replyImageRequestUrl } from "./reply-images.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
@@ -15,6 +21,8 @@ const ENDPOINT = "__AGENTNUDGE_ENDPOINT__";
 const ALLOWED_ORIGIN = "__AGENTNUDGE_ORIGIN__";
 const SESSION_ID = "__AGENTNUDGE_SESSION__";
 const BROWSER_TOKEN = "__AGENTNUDGE_BROWSER_TOKEN__";
+const BROWSER_CONTROL_ENABLED = Boolean(__AGENTNUDGE_BROWSER_CONTROL__);
+const PAGE_ID = createPageId();
 const HOST_ID = "agentnudge-widget";
 const INK_COLOR = "#df5b39";
 const INK_WIDTH = 4;
@@ -380,6 +388,7 @@ class AgentNudgeWidget extends HTMLElement {
     window.addEventListener("scroll", () => this.renderOverlay(), { signal, passive: true });
     this.renderAll();
     this.pollConversation();
+    if (BROWSER_CONTROL_ENABLED) this.pollBrowserCommands();
   }
 
   disconnectedCallback() {
@@ -647,6 +656,83 @@ class AgentNudgeWidget extends HTMLElement {
         await delay(1200);
       }
     }
+  }
+
+  async pollBrowserCommands() {
+    while (this.isConnected && !this.pollAbort.signal.aborted) {
+      try {
+        const response = await fetch(
+          browserCommandRequestUrl(ENDPOINT, PAGE_ID, location, document.title),
+          {
+            method: "GET",
+            mode: "cors",
+            cache: "no-store",
+            headers: { "X-AgentNudge-Token": BROWSER_TOKEN },
+            signal: this.pollAbort.signal,
+          },
+        );
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
+        if (result.status === "command" && result.command) {
+          await this.handleBrowserCommand(result.command);
+        }
+      } catch (error) {
+        if (this.pollAbort.signal.aborted) return;
+        this.setConnection("Browser control reconnecting…", true);
+        await delay(1200);
+      }
+    }
+  }
+
+  async handleBrowserCommand(command) {
+    if (command.session !== SESSION_ID || command.pageId !== PAGE_ID || !command.commandId) return;
+    const remaining = Math.max(1, Number(command.expiresAtUnixMs) - Date.now());
+    this.setConnection("Agent is controlling this page…", false);
+    let status = "completed";
+    let value = null;
+    let errorMessage = null;
+    let afterAcknowledge = null;
+    try {
+      if (remaining <= 1) throw new Error("The browser action expired before it reached the page");
+      const result = await performBrowserAction(command.action, {
+        document,
+        window,
+        host: this,
+        allowedOrigin: ALLOWED_ORIGIN,
+        timeoutMs: remaining,
+      });
+      value = result.value ?? null;
+      afterAcknowledge = result.afterAcknowledge ?? null;
+    } catch (error) {
+      status = "error";
+      errorMessage = truncate(error instanceof Error ? error.message : "Browser action failed", 2000);
+    }
+
+    const response = await fetch(`${ENDPOINT}/browser/commands/${encodeURIComponent(command.commandId)}`, {
+      method: "POST",
+      mode: "cors",
+      cache: "no-store",
+      headers: {
+        "Content-Type": "application/json",
+        "X-AgentNudge-Token": BROWSER_TOKEN,
+      },
+      body: JSON.stringify({
+        commandId: command.commandId,
+        pageId: PAGE_ID,
+        status,
+        value,
+        error: errorMessage,
+        currentUrl: safePageUrl(location),
+        title: document.title,
+      }),
+      signal: this.pollAbort.signal,
+    });
+    if (!response.ok && response.status !== 410) {
+      const result = await response.json().catch(() => ({}));
+      throw new Error(result.message || result.error || `HTTP ${response.status}`);
+    }
+    this.setConnection("Connected locally", false);
+    if (response.ok && status === "completed") afterAcknowledge?.();
   }
 
   async send() {

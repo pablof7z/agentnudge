@@ -10,6 +10,8 @@ Create one isolated session per active preview:
 agentnudge session --origin http://localhost:5173
 ```
 
+Add `--allow-browser-control` only when the agent needs to operate the connected preview. Browser actions remain unavailable in sessions that were not explicitly armed.
+
 The command returns immediately with JSON containing `session`, `widgetUrl`, and `scriptTag`. The session is a short NATO word such as `lima`. Pass it explicitly to every later command; it prevents concurrent local agents from consuming one another's messages. It is a routing handle, not a secret.
 
 ## Wait for feedback

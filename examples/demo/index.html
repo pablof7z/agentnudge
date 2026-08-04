@@ -50,11 +50,21 @@
       </label>
     </main>
     <script type="module">
-      const session = new URLSearchParams(location.search).get("agentnudge");
+      document.querySelector("#primary-action").addEventListener("click", (event) => {
+        event.currentTarget.dataset.clicked = "true";
+        event.currentTarget.textContent = "Started";
+      });
+
+      const parameters = new URLSearchParams(location.search);
+      const session = parameters.get("agentnudge");
+      const requestedPort = Number(parameters.get("agentnudgePort") || "4317");
+      const brokerPort = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65535
+        ? requestedPort
+        : 4317;
       if (session && /^[a-z]+$/.test(session)) {
         const widget = document.createElement("script");
         widget.type = "module";
-        widget.src = `http://127.0.0.1:4317/${session}/widget.js`;
+        widget.src = `http://127.0.0.1:${brokerPort}/${session}/widget.js`;
         document.body.append(widget);
       }
     </script>
