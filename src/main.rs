@@ -131,6 +131,12 @@ enum BrowserCommand {
         duration: String,
     },
 
+    /// Capture the visible page as a redacted PNG and return its local path.
+    Screenshot {
+        /// Maximum foreground wait for the action result.
+        duration: String,
+    },
+
     /// Click the element matching a CSS selector.
     Click {
         duration: String,
@@ -230,6 +236,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 }
                 BrowserCommand::Snapshot { duration } => {
                     print_browser_result(&session, page, duration, BrowserAction::Snapshot).await?;
+                }
+                BrowserCommand::Screenshot { duration } => {
+                    print_browser_result(&session, page, duration, BrowserAction::Screenshot)
+                        .await?;
                 }
                 BrowserCommand::Click { duration, selector } => {
                     print_browser_result(
@@ -407,6 +417,15 @@ mod tests {
             .command,
             Command::Browser {
                 action: BrowserCommand::Click { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["agentnudge", "browser", "lima", "screenshot", "10s"])
+                .unwrap()
+                .command,
+            Command::Browser {
+                action: BrowserCommand::Screenshot { .. },
                 ..
             }
         ));

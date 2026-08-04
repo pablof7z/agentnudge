@@ -700,6 +700,7 @@ class AgentNudgeWidget extends HTMLElement {
         host: this,
         allowedOrigin: ALLOWED_ORIGIN,
         timeoutMs: remaining,
+        captureScreenshot: () => this.captureScreenshot(),
       });
       value = result.value ?? null;
       afterAcknowledge = result.afterAcknowledge ?? null;

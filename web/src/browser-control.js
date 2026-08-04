@@ -41,6 +41,14 @@ export async function performBrowserAction(action, context) {
   switch (action?.kind) {
     case "snapshot":
       return { value: snapshotPage(pageDocument, pageWindow, host) };
+    case "screenshot": {
+      if (typeof context.captureScreenshot !== "function") {
+        throw new Error("Screenshot capture is unavailable");
+      }
+      return {
+        value: { screenshotDataUrl: await context.captureScreenshot() },
+      };
+    }
     case "click": {
       const element = controlledElement(pageDocument, host, action.selector);
       ensureVisible(element, pageWindow);

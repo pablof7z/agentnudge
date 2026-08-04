@@ -22,7 +22,7 @@ Use `rustfmt` defaults (four-space indentation) and keep Clippy clean. Follow Ru
 
 Place Rust unit tests in a local `#[cfg(test)] mod tests`; name tests after observable behavior. Put widget tests in `web/test/*.test.js` and use `node:test`. There is no numeric coverage threshold, but changes should cover new protocol, geometry, and failure behavior. Widget and broker changes require exercising the demo: create two word sessions, prove their waits are isolated, send a message, inspect its screenshot and `message.json`, run send-and-wait `reply`, and confirm both the sidebar update and next foreground completion. Widget source changes also require rebuilding `web/dist/widget.js`.
 
-Execution changes require a real direct-argv command, nonzero-output, and timeout smoke test. Browser-control changes require an explicitly armed demo session and a typed action round trip against a connected page; verify action expiry and session isolation as well as the successful path.
+Execution changes require a real direct-argv command, nonzero-output, and timeout smoke test. Browser-control changes require an explicitly armed demo session and a typed action round trip against a connected page; verify action expiry and session isolation as well as the successful path. Screenshot changes also require validating and inspecting the broker-persisted PNG.
 
 ## Commit & Pull Request Guidelines
 

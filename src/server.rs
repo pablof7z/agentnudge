@@ -164,8 +164,16 @@ struct BrowserControlState {
 
 struct PendingBrowserCommand {
     page_id: String,
-    fill_characters: Option<usize>,
+    expires_at_unix_ms: u64,
+    result_policy: BrowserResultPolicy,
     sender: oneshot::Sender<BrowserCommandResultSubmission>,
+}
+
+#[derive(Clone)]
+enum BrowserResultPolicy {
+    Standard,
+    Fill { characters: usize },
+    Screenshot,
 }
 
 #[derive(Clone)]
@@ -716,10 +724,7 @@ async fn agent_browser_action(
     let started = Instant::now();
     let command_id = Uuid::new_v4().to_string();
     let (sender, receiver) = oneshot::channel();
-    let fill_characters = match &request.action {
-        BrowserAction::Fill { text, .. } => Some(text.chars().count()),
-        _ => None,
-    };
+    let result_policy = browser_result_policy(&request.action);
     let page_id = {
         let mut browser = session.browser_control.lock().await;
         prune_stale_browser_pages(&mut browser, now);
@@ -740,7 +745,8 @@ async fn agent_browser_action(
             command_id.clone(),
             PendingBrowserCommand {
                 page_id: page_id.clone(),
-                fill_characters,
+                expires_at_unix_ms,
+                result_policy,
                 sender,
             },
         );
@@ -1275,7 +1281,40 @@ async fn browser_command_result(
             json!({"error": "browser_page_mismatch"}),
         );
     }
-    let result = redact_fill_result(result, pending.fill_characters);
+    let now = match unix_time_ms_u64() {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "clock_error", "message": error.to_string()}),
+            );
+        }
+    };
+    if now > pending.expires_at_unix_ms || pending.sender.is_closed() {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::GONE,
+            json!({"error": "browser_command_expired"}),
+        );
+    }
+    let result =
+        match finalize_browser_result(result, &pending.result_policy, &session, &command_id) {
+            Ok(value) => value,
+            Err(error) => {
+                session
+                    .browser_control
+                    .lock()
+                    .await
+                    .pending
+                    .insert(command_id.clone(), pending);
+                return json_response(
+                    &session.allowed_origin,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    json!({"error": "invalid_browser_result", "message": error.to_string()}),
+                );
+            }
+        };
     let _ = pending.sender.send(result);
     cors_json(
         &session.allowed_origin,
@@ -1685,7 +1724,7 @@ fn validate_wait(duration: Duration) -> Result<()> {
 
 fn validate_browser_action(action: &mut BrowserAction, allowed_origin: &str) -> Result<()> {
     match action {
-        BrowserAction::Snapshot | BrowserAction::Reload => {}
+        BrowserAction::Snapshot | BrowserAction::Screenshot | BrowserAction::Reload => {}
         BrowserAction::Click { selector } | BrowserAction::WaitFor { selector } => {
             sanitize_browser_selector(selector)?;
         }
@@ -1720,6 +1759,16 @@ fn validate_browser_action(action: &mut BrowserAction, allowed_origin: &str) -> 
         }
     }
     Ok(())
+}
+
+fn browser_result_policy(action: &BrowserAction) -> BrowserResultPolicy {
+    match action {
+        BrowserAction::Fill { text, .. } => BrowserResultPolicy::Fill {
+            characters: text.chars().count(),
+        },
+        BrowserAction::Screenshot => BrowserResultPolicy::Screenshot,
+        _ => BrowserResultPolicy::Standard,
+    }
 }
 
 fn sanitize_browser_selector(selector: &mut String) -> Result<()> {
@@ -1778,11 +1827,6 @@ fn validate_browser_result(
     if !matches!(result.status.as_str(), "completed" | "error") {
         bail!("browser result status must be `completed` or `error`");
     }
-    if let Some(value) = &result.value
-        && serde_json::to_vec(value)?.len() > MAX_BROWSER_RESULT_BYTES
-    {
-        bail!("browser result exceeds the {MAX_BROWSER_RESULT_BYTES}-byte limit");
-    }
     result.error = result
         .error
         .take()
@@ -1799,21 +1843,86 @@ fn validate_browser_result(
     Ok(result)
 }
 
-fn redact_fill_result(
+fn finalize_browser_result(
     mut result: BrowserCommandResultSubmission,
-    fill_characters: Option<usize>,
-) -> BrowserCommandResultSubmission {
-    let Some(characters) = fill_characters else {
-        return result;
-    };
-    if result.status == "completed" {
-        result.value = Some(json!({"filled": true, "characters": characters}));
-        result.error = None;
-    } else {
-        result.value = None;
-        result.error = Some("the connected page reported that the fill action failed".into());
+    policy: &BrowserResultPolicy,
+    session: &SessionState,
+    command_id: &str,
+) -> Result<BrowserCommandResultSubmission> {
+    match policy {
+        BrowserResultPolicy::Standard => {
+            if let Some(value) = &result.value
+                && serde_json::to_vec(value)?.len() > MAX_BROWSER_RESULT_BYTES
+            {
+                bail!("browser result exceeds the {MAX_BROWSER_RESULT_BYTES}-byte limit");
+            }
+        }
+        BrowserResultPolicy::Fill { characters } => {
+            if result.status == "completed" {
+                result.value = Some(json!({"filled": true, "characters": characters}));
+                result.error = None;
+            } else {
+                result.value = None;
+                result.error =
+                    Some("the connected page reported that the fill action failed".into());
+            }
+        }
+        BrowserResultPolicy::Screenshot => {
+            if result.status == "completed" {
+                let data_url = result
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.get("screenshotDataUrl"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("a completed screenshot result needs screenshotDataUrl")?;
+                let path = persist_browser_screenshot(session, command_id, data_url)?;
+                result.value = Some(json!({
+                    "screenshotPath": path.display().to_string(),
+                    "mediaType": "image/png",
+                }));
+                result.error = None;
+            } else {
+                result.value = None;
+            }
+        }
     }
-    result
+    Ok(result)
+}
+
+fn persist_browser_screenshot(
+    session: &SessionState,
+    command_id: &str,
+    data_url: &str,
+) -> Result<PathBuf> {
+    let bytes = decode_screenshot(data_url)?;
+    let directory = session.output.join("browser-screenshots");
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "could not create browser screenshot directory {}",
+            directory.display()
+        )
+    })?;
+    let final_path = directory.join(format!("{command_id}.png"));
+    let temporary_path = directory.join(format!(".{command_id}.tmp"));
+    if final_path.exists() || temporary_path.exists() {
+        bail!("the browser screenshot output already exists");
+    }
+    std::fs::write(&temporary_path, bytes).with_context(|| {
+        format!(
+            "could not write browser screenshot {}",
+            temporary_path.display()
+        )
+    })?;
+    if let Err(error) = std::fs::rename(&temporary_path, &final_path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error).with_context(|| {
+            format!(
+                "could not finalize browser screenshot {}",
+                final_path.display()
+            )
+        });
+    }
+    Ok(final_path)
 }
 
 fn validate_page_id(value: &str) -> Result<String> {
@@ -2874,6 +2983,127 @@ mod tests {
                 .unwrap()
                 .contains(PRIVATE_TEXT)
         );
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_results_are_validated_and_persisted_as_png_files() {
+        const PAGE_ID: &str = "75554628-7b7b-4c9b-aa0a-433f829e5e3b";
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let session_id = created.session.clone();
+        let session = find_session(&broker, &session_id).await.unwrap();
+        session
+            .browser_control
+            .lock()
+            .await
+            .pages
+            .insert(PAGE_ID.into(), browser_page(PAGE_ID));
+
+        let action_broker = broker.clone();
+        let action_session = session_id.clone();
+        let action_headers = agent_headers(&broker);
+        let action_task = tokio::spawn(async move {
+            agent_browser_action(
+                AxumPath(action_session),
+                State(action_broker),
+                action_headers,
+                Query(WaitQuery { timeout_ms: 2_000 }),
+                Json(BrowserActionRequest {
+                    page_id: None,
+                    action: BrowserAction::Screenshot,
+                }),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if !session.browser_control.lock().await.commands.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let delivered = browser_commands(
+            AxumPath(session_id.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Query(BrowserCommandQuery {
+                page_id: PAGE_ID.into(),
+                url: "http://localhost:5173/".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        let delivered: BrowserCommandPollResponse = response_json(delivered).await;
+        let command = delivered.command.unwrap();
+        assert!(matches!(command.action, BrowserAction::Screenshot));
+
+        let rejected = browser_command_result(
+            AxumPath((session_id.clone(), command.command_id.clone())),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(BrowserCommandResultSubmission {
+                command_id: command.command_id.clone(),
+                page_id: PAGE_ID.into(),
+                status: "completed".into(),
+                value: Some(json!({"screenshotDataUrl": "data:image/png;base64,aGVsbG8="})),
+                error: None,
+                current_url: "http://localhost:5173/".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            session
+                .browser_control
+                .lock()
+                .await
+                .pending
+                .contains_key(&command.command_id)
+        );
+
+        let accepted = browser_command_result(
+            AxumPath((session_id.clone(), command.command_id.clone())),
+            State(broker),
+            browser_headers(&session),
+            Json(BrowserCommandResultSubmission {
+                command_id: command.command_id,
+                page_id: PAGE_ID.into(),
+                status: "completed".into(),
+                value: Some(json!({"screenshotDataUrl": ONE_PIXEL_PNG})),
+                error: None,
+                current_url: "http://localhost:5173/?private=yes".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let response: BrowserActionResponse = response_json(action_task.await.unwrap()).await;
+        let screenshot_path = PathBuf::from(
+            response
+                .value
+                .as_ref()
+                .and_then(|value| value.get("screenshotPath"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap(),
+        );
+        assert!(
+            screenshot_path.starts_with(
+                temporary
+                    .path()
+                    .join(session_id)
+                    .join("browser-screenshots")
+            )
+        );
+        assert_eq!(std::fs::read(screenshot_path).unwrap(), png_bytes());
+        assert_eq!(response.value.as_ref().unwrap()["mediaType"], "image/png");
     }
 
     #[tokio::test]

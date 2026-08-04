@@ -138,6 +138,7 @@ When exactly one page is connected, actions target it automatically. Pass `--pag
 
 ```sh
 agentnudge browser lima snapshot 10s
+agentnudge browser lima screenshot 30s
 agentnudge browser lima click 10s --selector '#primary-action'
 agentnudge browser lima fill 10s --selector '#email' --text 'person@example.com'
 agentnudge browser lima scroll 10s --selector '#pricing'
@@ -146,7 +147,7 @@ agentnudge browser lima navigate 10s --url '/preview'
 agentnudge browser lima reload 10s
 ```
 
-Every action is a foreground request with an ID, expiry, page target, and structured receipt. Snapshot text and all browser results are labeled as untrusted page evidence. Snapshot is bounded to visible semantic and interactive elements; it never returns form values. `fill` returns only the number of characters written and is never added to the transcript or evidence directory. Redacted regions and password, hidden, or file inputs cannot be targeted.
+Every action is a foreground request with an ID, expiry, page target, and structured receipt. Snapshot text, screenshots, and all browser results are labeled as untrusted page evidence. `snapshot` is bounded to visible semantic and interactive elements and never returns form values. `screenshot` captures the visible viewport through the same redaction path used for feedback, validates the PNG in the broker, saves it under the session output directory, and returns its local path. `fill` returns only the number of characters written and is never added to the transcript or evidence directory. Redacted regions and password, hidden, or file inputs cannot be targeted.
 
 The widget may execute only the typed actions above. Browser-authenticated routes cannot author commands or run local processes, and raw page JavaScript evaluation is not exposed. Navigation is restricted to the session's exact origin so the widget remains in control. This v1 controls the instrumented preview page, not browser chrome, tabs, downloads, permission dialogs, cross-origin frames, or pages without the widget.
 
@@ -236,7 +237,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-The generated `web/dist/widget.js` is checked in so installing the Rust binary does not require Node.js. Rebuild it after changing `web/src/widget.js`.
+The generated `web/dist/widget.js` is checked in so installing the Rust binary does not require Node.js. Rebuild it after changing files under `web/src/`.
 
 ## Scope
 

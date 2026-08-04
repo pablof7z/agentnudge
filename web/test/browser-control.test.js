@@ -93,6 +93,27 @@ test("fills an input without echoing its value in the action result", async () =
   assert.doesNotMatch(JSON.stringify(result.value), /private@example\.com/);
 });
 
+test("captures a screenshot only through the supplied redacted capture callback", async () => {
+  let captures = 0;
+  const result = await performBrowserAction(
+    { kind: "screenshot" },
+    {
+      document: {},
+      window: fakeWindow(),
+      host: {},
+      allowedOrigin: "http://localhost:5173",
+      async captureScreenshot() {
+        captures += 1;
+        return "data:image/png;base64,redacted";
+      },
+    },
+  );
+  assert.equal(captures, 1);
+  assert.deepEqual(result.value, {
+    screenshotDataUrl: "data:image/png;base64,redacted",
+  });
+});
+
 test("snapshot excludes form values and navigation stays on the allowed origin", async () => {
   const input = fakeElement({ textContent: "secret form value" });
   const button = fakeElement({
