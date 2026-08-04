@@ -1,14 +1,16 @@
 import html2canvas from "html2canvas";
+import { pointInClosedPath, rectanglePoints } from "./annotation-geometry.js";
 import { paintAnnotationOverlay } from "./annotation-overlay.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
 import iconGrip from "@tabler/icons/outline/grip-horizontal.svg";
+import iconComment from "@tabler/icons/outline/message-plus.svg";
 import iconMessage from "@tabler/icons/outline/message-dots.svg";
 import iconNote from "@tabler/icons/outline/note.svg";
 import iconPencil from "@tabler/icons/outline/pencil.svg";
 import iconPointer from "@tabler/icons/outline/pointer.svg";
-import iconSelect from "@tabler/icons/outline/select.svg";
+import iconRectangle from "@tabler/icons/outline/square-dashed.svg";
 import iconSend from "@tabler/icons/outline/send.svg";
 import iconTrash from "@tabler/icons/outline/trash.svg";
 import iconX from "@tabler/icons/outline/x.svg";
@@ -72,7 +74,7 @@ const css = String.raw`
   }
 
   .tray {
-    width: min(300px, calc(100vw - 78px));
+    width: min(326px, calc(100vw - 78px));
     border: 1px solid var(--border);
     border-radius: 13px;
     background: color-mix(in srgb, var(--surface) 94%, transparent);
@@ -119,9 +121,20 @@ const css = String.raw`
     cursor: pointer;
     transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
   }
+  .icon-button { position: relative; }
   .icon-button:hover { background: var(--surface-hover); color: var(--text); }
   .icon-button:active, .launcher:active { transform: scale(.96); }
   .icon-button[data-active="true"] { background: var(--accent-soft); color: var(--accent); }
+  .comment-toggle[data-has-content="true"]::after {
+    content: "";
+    position: absolute;
+    right: 5px;
+    top: 5px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--accent);
+  }
   .icon-button:disabled { opacity: .32; cursor: default; }
   .icon-button:disabled:hover { background: transparent; color: var(--muted); }
   .icon-button:focus-visible, .launcher:focus-visible, textarea:focus-visible {
@@ -150,26 +163,27 @@ const css = String.raw`
 
   .general-note {
     border-top: 1px solid var(--border);
-    padding: 5px 9px 7px;
+    padding: 9px 10px 11px;
   }
+  .general-note[hidden] { display: none; }
   .general-note textarea {
     display: block;
     width: 100%;
-    height: 26px;
-    min-height: 26px;
-    max-height: min(42dvh, 320px);
+    height: 112px;
+    min-height: 112px;
+    max-height: min(52dvh, 380px);
     resize: none;
     overflow: hidden;
     border: 0;
-    border-radius: 0;
-    padding: 3px 4px;
-    background: transparent;
+    border-radius: 9px;
+    padding: 10px 11px;
+    background: var(--surface-hover);
     color: var(--text);
-    line-height: 20px;
+    line-height: 1.45;
     transition: background-color 160ms ease;
   }
   .general-note textarea::placeholder { color: var(--muted); opacity: .82; }
-  .general-note textarea:focus { background: color-mix(in srgb, var(--surface-hover) 55%, transparent); }
+  .general-note textarea:focus { background: color-mix(in srgb, var(--surface-hover) 76%, var(--surface)); }
 
   .sr-only {
     position: absolute;
@@ -191,7 +205,7 @@ const css = String.raw`
     pointer-events: none;
     z-index: 1;
   }
-  .overlay svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .overlay > svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
   .hover-box { fill: rgb(164 194 56 / .10); stroke: #61751a; stroke-width: 2; stroke-dasharray: 6 4; }
   .pending-box { fill: rgb(37 99 199 / .08); stroke: var(--selection); stroke-width: 2; stroke-dasharray: 6 4; }
   .annotation-box { fill: rgb(220 88 53 / .07); stroke: var(--accent); stroke-width: 2; }
@@ -230,7 +244,7 @@ const css = String.raw`
   .sticky-target { min-width: 0; flex: 1; color: var(--sticky-muted); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .sticky-icon { width: 26px; height: 26px; display: grid; place-items: center; flex: none; border: 0; border-radius: 7px; padding: 0; background: transparent; color: var(--sticky-muted); cursor: pointer; }
   .sticky-icon:hover { background: var(--sticky-hover); color: var(--sticky-text); }
-  .sticky-icon svg { width: 16px; height: 16px; }
+  .sticky-icon svg { position: static; inset: auto; width: 16px; height: 16px; }
   .sticky-grip { cursor: grab; }
   .sticky-message { min-height: 22px; padding: 2px 1px; font-size: 13px; line-height: 1.46; overflow-wrap: anywhere; white-space: pre-wrap; cursor: text; user-select: text; }
   .sticky-card textarea {
@@ -268,6 +282,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.undoStack = [];
     this.redoStack = [];
     this.generalBeforeEdit = null;
+    this.generalOpen = false;
     this.draft = null;
     this.editingCommentId = null;
     this.editingMessage = "";
@@ -291,14 +306,15 @@ class AgentNudgeWidget extends HTMLElement {
             ${iconButtonMarkup("select-mode", "Select drawing", iconPointer)}
             ${iconButtonMarkup("sticky-mode", "Add sticky note", iconNote)}
             ${iconButtonMarkup("draw-mode", "Draw", iconPencil)}
-            ${iconButtonMarkup("region-mode", "Select drawing region", iconSelect)}
+            ${iconButtonMarkup("region-mode", "Mark area", iconRectangle)}
+            ${iconButtonMarkup("comment-toggle", "Page comment", iconComment)}
             <span class="separator" aria-hidden="true"></span>
             ${iconButtonMarkup("undo", "Undo", iconUndo)}
             ${iconButtonMarkup("redo", "Redo", iconRedo)}
             ${iconButtonMarkup("delete-selection", "Delete selected drawing", iconTrash)}
           </div>
-          <div class="general-note">
-            <textarea rows="1" maxlength="10000" aria-label="General comment" placeholder="General comment"></textarea>
+          <div class="general-note" hidden>
+            <textarea maxlength="10000" aria-label="Page comment" placeholder="Comment on this page"></textarea>
           </div>
         </section>
         <button class="launcher" type="button" aria-label="Open annotation toolbar" aria-expanded="false" title="Open annotation toolbar">${iconMessage}</button>
@@ -319,6 +335,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.dock = root.querySelector(".dock");
     this.launcher = root.querySelector(".launcher");
     this.general = root.querySelector(".general-note textarea");
+    this.generalPanel = root.querySelector(".general-note");
     this.status = root.querySelector(".status");
     this.hoverBox = root.querySelector(".hover-box");
     this.pendingBox = root.querySelector(".pending-box");
@@ -334,6 +351,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.root.querySelector(".sticky-mode").addEventListener("click", () => this.setMode("sticky"), { signal });
     this.root.querySelector(".draw-mode").addEventListener("click", () => this.setMode("draw"), { signal });
     this.root.querySelector(".region-mode").addEventListener("click", () => this.setMode("region"), { signal });
+    this.root.querySelector(".comment-toggle").addEventListener("click", () => this.toggleGeneralComment(), { signal });
     this.root.querySelector(".undo").addEventListener("click", () => this.undo(), { signal });
     this.root.querySelector(".redo").addEventListener("click", () => this.redo(), { signal });
     this.root.querySelector(".delete-selection").addEventListener("click", () => this.deleteSelectedStrokes(), { signal });
@@ -384,9 +402,21 @@ class AgentNudgeWidget extends HTMLElement {
     this.pendingRect = null;
     this.dragStart = null;
     this.pointerTarget = null;
-    if (!["select", "region"].includes(mode)) this.selectedStrokeIds.clear();
+    if (mode !== "select") this.selectedStrokeIds.clear();
     this.invalidatePreview();
     this.render();
+  }
+
+  toggleGeneralComment() {
+    if (this.sent) return;
+    this.generalOpen = !this.generalOpen;
+    this.renderGeneralComment();
+    if (this.generalOpen) {
+      queueMicrotask(() => {
+        this.general.focus();
+        this.autoSizeGeneral();
+      });
+    }
   }
 
   beginGeneralEdit() {
@@ -397,6 +427,7 @@ class AgentNudgeWidget extends HTMLElement {
   onGeneralInput() {
     this.autoSizeGeneral();
     this.invalidatePreview();
+    this.root.querySelector(".comment-toggle").dataset.hasContent = String(Boolean(this.general.value.trim()));
   }
 
   finishGeneralEdit() {
@@ -409,9 +440,10 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   autoSizeGeneral() {
-    const maximum = Math.min(320, window.innerHeight * .42);
-    this.general.style.height = "26px";
-    const height = Math.min(maximum, Math.max(26, this.general.scrollHeight));
+    if (!this.generalOpen) return;
+    const maximum = Math.min(380, window.innerHeight * .52);
+    this.general.style.height = "112px";
+    const height = Math.min(maximum, Math.max(112, this.general.scrollHeight));
     this.general.style.height = `${height}px`;
     this.general.style.overflowY = this.general.scrollHeight > maximum ? "auto" : "hidden";
   }
@@ -524,9 +556,14 @@ class AgentNudgeWidget extends HTMLElement {
       const rect = this.pendingRect;
       this.selectedStrokeIds.clear();
       if (rect && rect.width >= 6 && rect.height >= 6) {
-        for (const stroke of this.strokes) {
-          if (strokeIntersectsRect(stroke, rect)) this.selectedStrokeIds.add(stroke.id);
-        }
+        this.pushUndo();
+        this.strokeCounter += 1;
+        this.strokes.push({
+          id: `stroke-${this.strokeCounter}`,
+          points: rectanglePoints(rect),
+          color: INK_COLOR,
+          width: INK_WIDTH,
+        });
       }
       this.dragStart = null;
       this.pointerTarget = null;
@@ -600,6 +637,10 @@ class AgentNudgeWidget extends HTMLElement {
     } else if (this.editingCommentId) {
       event.preventDefault();
       this.cancelEditComment();
+    } else if (this.generalOpen) {
+      event.preventDefault();
+      this.generalOpen = false;
+      this.renderGeneralComment();
     } else if (this.opened) {
       event.preventDefault();
       this.opened = false;
@@ -952,7 +993,7 @@ class AgentNudgeWidget extends HTMLElement {
       if (!button.matches(".undo, .redo, .delete-selection")) button.disabled = this.sent;
     });
     this.general.disabled = this.sent;
-    this.autoSizeGeneral();
+    this.renderGeneralComment();
     this.renderHistoryButtons();
     this.renderOverlay();
   }
@@ -961,6 +1002,16 @@ class AgentNudgeWidget extends HTMLElement {
     this.root.querySelector(".undo").disabled = this.sent || this.undoStack.length === 0;
     this.root.querySelector(".redo").disabled = this.sent || this.redoStack.length === 0;
     this.root.querySelector(".delete-selection").disabled = this.sent || this.selectedStrokeIds.size === 0;
+  }
+
+  renderGeneralComment() {
+    const button = this.root.querySelector(".comment-toggle");
+    this.generalPanel.hidden = !this.generalOpen;
+    button.dataset.active = String(this.generalOpen);
+    button.dataset.hasContent = String(Boolean(this.general.value.trim()));
+    button.setAttribute("aria-pressed", String(this.generalOpen));
+    button.disabled = this.sent;
+    if (this.generalOpen) this.autoSizeGeneral();
   }
 
   renderOverlay() {
@@ -1328,30 +1379,9 @@ function nearDrawing(point, strokes) {
 }
 
 function strokeHitDistance(point, stroke) {
+  if (pointInClosedPath(point, stroke.points)) return 0;
   if (stroke.points.length === 1) return pointDistance(point, stroke.points[0]);
   return Math.min(...stroke.points.slice(1).map((end, index) => pointToSegmentDistance(point, stroke.points[index], end)));
-}
-
-function strokeIntersectsRect(stroke, rect) {
-  if (stroke.points.some((point) => pointInsideRect(point, rect))) return true;
-  return stroke.points.slice(1).some((end, index) => segmentIntersectsRect(stroke.points[index], end, rect));
-}
-
-function pointInsideRect(point, rect) {
-  return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
-}
-
-function segmentIntersectsRect(start, end, rect) {
-  const bounds = {
-    x: Math.min(start.x, end.x),
-    y: Math.min(start.y, end.y),
-    width: Math.abs(end.x - start.x),
-    height: Math.abs(end.y - start.y),
-  };
-  return bounds.x <= rect.x + rect.width
-    && bounds.x + bounds.width >= rect.x
-    && bounds.y <= rect.y + rect.height
-    && bounds.y + bounds.height >= rect.y;
 }
 
 function pointDistance(first, second) {

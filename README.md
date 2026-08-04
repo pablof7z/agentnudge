@@ -25,7 +25,7 @@ In another terminal:
 cargo run -- wait --origin http://localhost:5173 --json
 ```
 
-Open `http://localhost:5173` and click the small message icon. The dock expands to the left and the launcher becomes the primary send button. Choose the sticky-note tool, then click an element or empty point, or drag around an area. Write the note in the card that appears beside the target and save it. Drag any card by its header, double-click its text to edit it, or use its trash icon to delete it. Use the pencil for freehand ink, the pointer or rectangular-selection tool to select ink, and the toolbar trash icon to remove selected strokes. Undo and redo cover notes, ink, card moves, and the page-level comment. Click the primary send button to capture the annotated page, submit the whole batch, and complete the waiting command.
+Open `http://localhost:5173` and click the small message icon. The dock expands to the left and the launcher becomes the primary send button. Choose the sticky-note tool, then click an element or empty point, or drag around an area. Write the note in the card that appears beside the target and save it. Drag any card by its header, double-click its text to edit it, or use its trash icon to delete it. Use the pencil for freehand ink and the dashed-square tool to leave a persistent rectangle around an area. The pointer selects either kind of mark so the toolbar trash icon can remove it. The comment icon opens a larger page-level comment field. Undo and redo cover notes, marks, card moves, and the page-level comment. Click the primary send button to capture the annotated page, submit the whole batch, and complete the waiting command.
 
 ```json
 {
@@ -74,12 +74,12 @@ Update the development script URL to match.
 
 Every bundle contains:
 
-- An optional page-level comment from a borderless field that starts at one line and expands while focused.
+- An optional page-level comment from the larger field opened by the comment icon.
 - A sanitized page URL with query and fragment removed.
 - Viewport and scroll coordinates.
 - A batch of numbered sticky notes, each with its saved card position and optionally attached to an element or rectangular area.
 - Element metadata for comment targets: tag, role, accessible name, bounded text, classes, selector, and rectangle.
-- Freehand drawing strokes as bounded point sequences with stable IDs for selection and deletion.
+- Freehand and rectangular marks as bounded point sequences with stable IDs for selection and deletion.
 - The annotated screenshot captured when the user sends the batch.
 
 Place a free-floating sticky next to a circle, underline, or handwritten mark when the note is about your drawing rather than a DOM element. Saved stickies remain visible, movable, and editable while the toolbar is open.
