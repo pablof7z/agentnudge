@@ -6,6 +6,10 @@ A development-only message button opens a sidebar directly in the website. You c
 
 No account, hosted service, browser extension, or multi-computer transport is involved in this version.
 
+## Agent skill
+
+Reusable agent instructions live in [`skills/agentnudge`](skills/agentnudge). Install or reference that folder from an agent's skill directory, then invoke `$agentnudge` to add and operate the local feedback loop.
+
 ## The agent loop
 
 Create an isolated session for the website's exact origin:
