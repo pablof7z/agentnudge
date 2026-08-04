@@ -46,7 +46,8 @@ pub struct Viewport {
 pub struct FeedbackComment {
     pub id: String,
     pub message: String,
-    pub selection: Selection,
+    pub position: Point,
+    pub selection: Option<Selection>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -188,7 +189,10 @@ impl FeedbackSubmission {
                     "a comment exceeds the {MAX_COMMENT_CHARS}-character limit"
                 ));
             }
-            sanitize_selection(&mut comment.selection)?;
+            validate_point(&comment.position)?;
+            if let Some(selection) = &mut comment.selection {
+                sanitize_selection(selection)?;
+            }
         }
 
         let mut point_count = 0usize;
@@ -227,10 +231,19 @@ impl FeedbackSubmission {
 
 impl FeedbackComment {
     pub fn summary(&self, number: usize) -> String {
+        let target = self.selection.as_ref().map_or_else(
+            || {
+                format!(
+                    "page point ({:.0}, {:.0})",
+                    self.position.x, self.position.y
+                )
+            },
+            Selection::summary,
+        );
         format!(
             "{number}. \"{}\" on {}",
             truncate(&self.message, 160),
-            self.selection.summary()
+            target
         )
     }
 }
@@ -373,7 +386,8 @@ mod tests {
             comments: vec![FeedbackComment {
                 id: "comment-1".into(),
                 message: "  Make this clearer  ".into(),
-                selection: selection(),
+                position: Point { x: 280.0, y: 72.0 },
+                selection: Some(selection()),
             }],
             drawings: vec![DrawingStroke {
                 points: vec![Point { x: 1.0, y: 2.0 }, Point { x: 3.0, y: 4.0 }],
@@ -391,7 +405,14 @@ mod tests {
         assert_eq!(value.page.url, "http://localhost:5173/example");
         assert_eq!(value.comments[0].message, "Make this clearer");
         assert_eq!(
-            value.comments[0].selection.element.as_ref().unwrap().tag,
+            value.comments[0]
+                .selection
+                .as_ref()
+                .unwrap()
+                .element
+                .as_ref()
+                .unwrap()
+                .tag,
             "button"
         );
         assert_eq!(value.drawings[0].color, "#dc5835");
@@ -402,6 +423,16 @@ mod tests {
         let mut value = submission();
         value.message.clear();
         assert!(value.validate_and_sanitize("session").is_ok());
+    }
+
+    #[test]
+    fn accepts_a_free_floating_sticky_note() {
+        let mut value = submission();
+        value.message.clear();
+        value.comments[0].selection = None;
+        value.drawings.clear();
+        let value = value.validate_and_sanitize("session").unwrap();
+        assert!(value.comments[0].selection.is_none());
     }
 
     #[test]

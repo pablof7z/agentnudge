@@ -117,7 +117,7 @@ pub async fn wait_for_feedback(config: WaitConfig) -> Result<WaitResult> {
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({
         "status": "waiting",
-        "version": 2,
+        "version": 3,
         "sessionId": state.session_id,
         "allowedOrigin": state.allowed_origin,
     }))
@@ -286,7 +286,7 @@ fn persist_submission(
         .context("could not write the screenshot")?;
 
     let manifest = FeedbackManifest {
-        version: 2,
+        version: 3,
         received_at_unix_ms,
         session_id: submission.session_id.clone(),
         message: submission.message.clone(),
@@ -306,7 +306,7 @@ fn persist_submission(
         .context("could not atomically finalize the feedback bundle")?;
 
     Ok(FeedbackReceipt {
-        version: 2,
+        version: 3,
         status: "received",
         message: submission.message,
         page_url: submission.page.url,
