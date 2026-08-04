@@ -1,27 +1,20 @@
-export function paintAnnotationOverlay({
+export function paintMessageAttachments({
   context,
   canvas,
   viewport,
-  strokes,
-  comments,
-  resolveCommentRect,
+  attachments,
+  resolveAttachmentRect,
   paintStroke,
-  paintSticky,
+  paintMarker,
 }) {
   const scaleX = canvas.width / viewport.width;
   const scaleY = canvas.height / viewport.height;
   context.save();
   try {
     context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
-    strokes.forEach((stroke) => paintStroke(context, stroke));
-    comments.forEach((comment, index) => {
-      paintSticky(
-        context,
-        comment,
-        resolveCommentRect(comment),
-        comment.cardPosition,
-        index + 1,
-      );
+    attachments.forEach((attachment, index) => {
+      attachment.strokes.forEach((stroke) => paintStroke(context, stroke));
+      paintMarker(context, attachment, resolveAttachmentRect(attachment), index + 1);
     });
   } finally {
     context.restore();

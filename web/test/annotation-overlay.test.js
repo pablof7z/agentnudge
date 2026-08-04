@@ -2,9 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { pointInClosedPath, rectanglePoints } from "../src/annotation-geometry.js";
-import { paintAnnotationOverlay } from "../src/annotation-overlay.js";
+import { paintMessageAttachments } from "../src/annotation-overlay.js";
 
-test("turns an area drag into a closed rectangle stroke", () => {
+test("turns an area drag into a closed rectangle path", () => {
   const points = rectanglePoints({ x: 20, y: 30, width: 100, height: 40 });
   assert.deepEqual(points, [
     { x: 20, y: 30 },
@@ -17,26 +17,29 @@ test("turns an area drag into a closed rectangle stroke", () => {
   assert.equal(pointInClosedPath({ x: 160, y: 50 }, points), false);
 });
 
-test("resets the screenshot transform and paints ink and stickies", () => {
+test("resets the screenshot transform and paints numbered attachments", () => {
   const calls = [];
   const context = {
     save: () => calls.push(["save"]),
     setTransform: (...values) => calls.push(["setTransform", ...values]),
     restore: () => calls.push(["restore"]),
   };
-  const stroke = { id: "stroke-1" };
-  const comment = { id: "comment-1", cardPosition: { x: 320, y: 180 } };
+  const attachment = {
+    id: "attachment-1",
+    kind: "drawing",
+    rect: { x: 20, y: 30, width: 100, height: 40 },
+    strokes: [{ id: "stroke-1" }, { id: "stroke-2" }],
+  };
 
-  paintAnnotationOverlay({
+  paintMessageAttachments({
     context,
     canvas: { width: 2_400, height: 1_600 },
     viewport: { width: 1_200, height: 800 },
-    strokes: [stroke],
-    comments: [comment],
-    resolveCommentRect: () => ({ x: 20, y: 30, width: 100, height: 40 }),
+    attachments: [attachment],
+    resolveAttachmentRect: (value) => value.rect,
     paintStroke: (_context, value) => calls.push(["stroke", value.id]),
-    paintSticky: (_context, value, rect, position, number) => {
-      calls.push(["sticky", value.id, rect, position, number]);
+    paintMarker: (_context, value, rect, number) => {
+      calls.push(["marker", value.id, rect, number]);
     },
   });
 
@@ -44,13 +47,8 @@ test("resets the screenshot transform and paints ink and stickies", () => {
     ["save"],
     ["setTransform", 2, 0, 0, 2, 0, 0],
     ["stroke", "stroke-1"],
-    [
-      "sticky",
-      "comment-1",
-      { x: 20, y: 30, width: 100, height: 40 },
-      { x: 320, y: 180 },
-      1,
-    ],
+    ["stroke", "stroke-2"],
+    ["marker", "attachment-1", { x: 20, y: 30, width: 100, height: 40 }, 1],
     ["restore"],
   ]);
 });
