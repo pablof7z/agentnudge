@@ -7,9 +7,11 @@ import {
   safePageUrl,
 } from "./browser-control.js";
 import { replyImageLabel, replyImageRequestUrl } from "./reply-images.js";
+import { endSessionRequestUrl } from "./session-lifecycle.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
+import iconDoorExit from "@tabler/icons/outline/door-exit.svg";
 import iconMessage from "@tabler/icons/outline/message-dots.svg";
 import iconPencil from "@tabler/icons/outline/pencil.svg";
 import iconPointer from "@tabler/icons/outline/pointer.svg";
@@ -295,6 +297,10 @@ class AgentNudgeWidget extends HTMLElement {
     this.focusedMessageId = null;
     this.suppressNextClick = false;
     this.sending = false;
+    this.ending = false;
+    this.sessionEnded = false;
+    this.endArmed = false;
+    this.endArmTimer = null;
     this.undoStack = [];
     this.redoStack = [];
     this.replyImageCache = new Map();
@@ -309,6 +315,7 @@ class AgentNudgeWidget extends HTMLElement {
           <header class="header">
             <div class="brand-mark">${iconMessage}</div>
             <div class="brand"><strong>AgentNudge</strong><span class="connection">Connected locally</span></div>
+            ${iconButtonMarkup("end-session", "End session", iconDoorExit)}
             ${iconButtonMarkup("close", "Close chat", iconX)}
           </header>
           <section class="messages" aria-live="polite"></section>
@@ -353,6 +360,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.statusNode = this.shadowRoot.querySelector(".composer-status");
     this.connectionNode = this.shadowRoot.querySelector(".connection");
     this.sendButton = this.shadowRoot.querySelector(".send-button");
+    this.endSessionButton = this.shadowRoot.querySelector(".end-session");
     this.overlay = this.shadowRoot.querySelector(".overlay");
     this.captureModeNode = this.shadowRoot.querySelector(".capture-mode");
     this.imageViewer = this.shadowRoot.querySelector(".image-viewer");
@@ -365,6 +373,7 @@ class AgentNudgeWidget extends HTMLElement {
     const { signal } = this.abort;
     this.shadowRoot.querySelector(".launcher").addEventListener("click", () => this.open(), { signal });
     this.shadowRoot.querySelector(".close").addEventListener("click", () => this.close(), { signal });
+    this.endSessionButton.addEventListener("click", () => this.endSession(), { signal });
     this.shadowRoot.querySelector(".attach-element").addEventListener("click", () => this.startCapture("element"), { signal });
     this.shadowRoot.querySelector(".attach-region").addEventListener("click", () => this.startCapture("region"), { signal });
     this.shadowRoot.querySelector(".attach-drawing").addEventListener("click", () => this.startCapture("drawing"), { signal });
@@ -398,6 +407,7 @@ class AgentNudgeWidget extends HTMLElement {
       if (record.url) URL.revokeObjectURL(record.url);
     }
     this.replyImageCache.clear();
+    if (this.endArmTimer) clearTimeout(this.endArmTimer);
   }
 
   open() {
@@ -411,6 +421,52 @@ class AgentNudgeWidget extends HTMLElement {
     this.opened = false;
     this.focusedMessageId = null;
     this.renderAll();
+  }
+
+  async endSession() {
+    if (this.ending || this.sessionEnded) return;
+    if (!this.endArmed) {
+      this.endArmed = true;
+      this.setStatus("Press the end-session icon again to close this conversation.");
+      this.renderShell();
+      if (this.endArmTimer) clearTimeout(this.endArmTimer);
+      this.endArmTimer = setTimeout(() => {
+        this.endArmed = false;
+        this.endArmTimer = null;
+        if (!this.sessionEnded) this.setStatus("");
+        this.renderShell();
+      }, 4000);
+      return;
+    }
+
+    this.endArmed = false;
+    if (this.endArmTimer) clearTimeout(this.endArmTimer);
+    this.endArmTimer = null;
+    this.ending = true;
+    this.setStatus("Ending session…");
+    this.renderShell();
+    try {
+      const response = await fetch(endSessionRequestUrl(ENDPOINT), {
+        method: "DELETE",
+        mode: "cors",
+        cache: "no-store",
+        headers: { "X-AgentNudge-Token": BROWSER_TOKEN },
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
+      this.sessionEnded = true;
+      this.pollAbort.abort();
+      this.textarea.disabled = true;
+      this.textarea.placeholder = "Session ended";
+      this.setConnection("Session ended", false);
+      this.setStatus("This conversation is closed.");
+    } catch (error) {
+      console.error("AgentNudge could not end the session", error);
+      this.setStatus("Session could not be ended.", true);
+    } finally {
+      this.ending = false;
+      this.renderAll();
+    }
   }
 
   startCapture(mode) {
@@ -737,7 +793,7 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   async send() {
-    if (this.sending) return;
+    if (this.sending || this.sessionEnded) return;
     if (this.mode !== "idle") this.finishCapture();
     const text = this.textarea.value.trim();
     if (!text && this.draftAttachments.length === 0) {
@@ -885,6 +941,10 @@ class AgentNudgeWidget extends HTMLElement {
     }
     this.shadowRoot.querySelector(".capture-undo").disabled = this.undoStack.length === 0;
     this.shadowRoot.querySelector(".capture-redo").disabled = this.redoStack.length === 0;
+    this.endSessionButton.disabled = this.ending || this.sessionEnded;
+    this.endSessionButton.dataset.active = String(this.endArmed);
+    this.endSessionButton.title = this.endArmed ? "Press again to end session" : "End session";
+    this.endSessionButton.ariaLabel = this.endSessionButton.title;
   }
 
   renderDraftAttachments() {
@@ -1077,7 +1137,7 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   updateSendButton() {
-    this.sendButton.disabled = this.sending || (!this.textarea.value.trim() && this.draftAttachments.length === 0);
+    this.sendButton.disabled = this.sending || this.sessionEnded || (!this.textarea.value.trim() && this.draftAttachments.length === 0);
   }
 
   setStatus(message, error = false) {

@@ -38,6 +38,9 @@ use crate::model::{
     MAX_REPLY_IMAGE_BYTES, MAX_REPLY_IMAGE_TOTAL_BYTES, MAX_SCREENSHOT_BYTES, MessageManifest,
     MessageReceipt, PROTOCOL_VERSION, ReplyImageAttachment, ReplyReceipt, TrustBoundary,
 };
+use crate::runtime::{
+    RuntimeEvent, RuntimeHandle, RuntimeLaunchConfig, RuntimeSnapshot, RuntimeUserMessage,
+};
 
 const WIDGET_SOURCE: &str = include_str!("../web/dist/widget.js");
 const MAX_REQUEST_BYTES: usize = 15 * 1024 * 1024;
@@ -45,6 +48,8 @@ const DEFAULT_BROKER_PORT: u16 = 4317;
 const MAX_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 const BROWSER_PAGE_STALE_AFTER: Duration = Duration::from_secs(45);
 const BROWSER_COMMAND_POLL: Duration = Duration::from_secs(20);
+const COMPLETION_POLL: Duration = Duration::from_secs(20);
+const MAX_RUNTIME_CONTEXT_CHARS: usize = 100_000;
 const NATO_WORDS: [&str; 26] = [
     "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett",
     "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
@@ -56,6 +61,7 @@ pub struct SessionConfig {
     pub origin: Url,
     pub output: PathBuf,
     pub allow_browser_control: bool,
+    pub runtime: Option<RuntimeLaunchConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +79,8 @@ pub struct SessionCreated {
     pub widget_url: String,
     pub script_tag: String,
     pub browser_control_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSnapshot>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -93,6 +101,40 @@ pub struct EndSessionReceipt {
     pub version: u8,
     pub status: String,
     pub session: String,
+    pub transcript: SessionTranscript,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserEndSessionReceipt {
+    version: u8,
+    status: String,
+    session: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTranscript {
+    pub version: u8,
+    pub status: String,
+    pub session: String,
+    pub started_at_unix_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSnapshot>,
+    pub messages: Vec<ChatMessage>,
+    pub transcript_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionCompletionResponse {
+    version: u8,
+    status: String,
+    session: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript: Option<SessionTranscript>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -111,6 +153,8 @@ struct CreateSessionRequest {
     output_directory: String,
     #[serde(default)]
     allow_browser_control: bool,
+    #[serde(default)]
+    runtime: Option<RuntimeLaunchConfig>,
 }
 
 #[derive(Deserialize)]
@@ -145,6 +189,8 @@ struct SessionState {
     session_id: String,
     browser_token: String,
     output: PathBuf,
+    transcript_path: PathBuf,
+    started_at_unix_ms: u128,
     conversation: Arc<Mutex<Conversation>>,
     reply_assets: Arc<Mutex<HashMap<String, StoredReplyAsset>>>,
     inbound_notify: Arc<Notify>,
@@ -152,6 +198,8 @@ struct SessionState {
     browser_control_enabled: bool,
     browser_control: Arc<Mutex<BrowserControlState>>,
     browser_command_notify: Arc<Notify>,
+    runtime: Arc<Mutex<Option<RuntimeHandle>>>,
+    completion_notify: Arc<Notify>,
     ended: Arc<AtomicBool>,
 }
 
@@ -204,6 +252,7 @@ struct BrokerState {
     endpoint: String,
     agent_token: String,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    completed_sessions: Arc<Mutex<HashMap<String, SessionTranscript>>>,
 }
 
 impl BrokerState {
@@ -212,6 +261,7 @@ impl BrokerState {
             endpoint,
             agent_token,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            completed_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -223,6 +273,7 @@ pub async fn start_session(config: SessionConfig) -> Result<SessionCreated> {
         origin: origin_string(&config.origin)?,
         output_directory: output.display().to_string(),
         allow_browser_control: config.allow_browser_control,
+        runtime: config.runtime,
     };
     let response = agent_client(Duration::from_secs(10))?
         .post(format!("{}/agent/sessions", descriptor.endpoint))
@@ -395,6 +446,44 @@ pub async fn end_session(session: &str) -> Result<EndSessionReceipt> {
     parse_response(response).await
 }
 
+pub async fn session_transcript(session: &str) -> Result<SessionTranscript> {
+    let session = validate_session_id(session)?;
+    let descriptor = live_broker().await?;
+    let response = agent_client(Duration::from_secs(10))?
+        .get(format!(
+            "{}/agent/sessions/{session}/transcript",
+            descriptor.endpoint
+        ))
+        .header("x-agentnudge-agent-token", &descriptor.agent_token)
+        .send()
+        .await
+        .context("could not read the AgentNudge transcript")?;
+    parse_response(response).await
+}
+
+pub async fn wait_for_session_end(session: &str) -> Result<SessionTranscript> {
+    let session = validate_session_id(session)?;
+    loop {
+        let descriptor = live_broker().await?;
+        let response = agent_client(COMPLETION_POLL.saturating_add(Duration::from_secs(10)))?
+            .get(format!(
+                "{}/agent/sessions/{session}/completion",
+                descriptor.endpoint
+            ))
+            .query(&[("timeout_ms", COMPLETION_POLL.as_millis() as u64)])
+            .header("x-agentnudge-agent-token", &descriptor.agent_token)
+            .send()
+            .await
+            .context("could not wait for the AgentNudge session to end")?;
+        let completion: SessionCompletionResponse = parse_response(response).await?;
+        if completion.status == "ended" {
+            return completion
+                .transcript
+                .context("the ended AgentNudge session returned no transcript");
+        }
+    }
+}
+
 pub async fn run_broker(config: BrokerConfig) -> Result<()> {
     let descriptor_file = absolute_path(&config.descriptor_file)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))
@@ -433,6 +522,14 @@ fn broker_router(state: BrokerState) -> Router {
         .route("/agent/sessions", post(create_session))
         .route("/agent/sessions/{session_id}", delete(delete_session))
         .route("/agent/sessions/{session_id}/wait", get(agent_wait))
+        .route(
+            "/agent/sessions/{session_id}/transcript",
+            get(agent_transcript),
+        )
+        .route(
+            "/agent/sessions/{session_id}/completion",
+            get(agent_completion),
+        )
         .route("/agent/sessions/{session_id}/reply", post(agent_reply))
         .route(
             "/agent/sessions/{session_id}/browser/pages",
@@ -450,6 +547,10 @@ fn broker_router(state: BrokerState) -> Router {
         .route(
             "/{session_id}/conversation",
             get(conversation).options(browser_preflight),
+        )
+        .route(
+            "/{session_id}/session",
+            delete(browser_end_session).options(browser_preflight),
         )
         .route(
             "/{session_id}/browser/commands",
@@ -516,7 +617,25 @@ async fn create_session(
             .into_response();
     }
 
-    match register_session(&state, origin, output, request.allow_browser_control).await {
+    if let Some(runtime) = request.runtime.as_ref()
+        && let Err(error) = validate_runtime_config(runtime)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "invalid_runtime", "message": error.to_string()})),
+        )
+            .into_response();
+    }
+
+    match register_session_with_runtime(
+        &state,
+        origin,
+        output,
+        request.allow_browser_control,
+        request.runtime,
+    )
+    .await
+    {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
         Err(error) => (
             StatusCode::CONFLICT,
@@ -526,34 +645,94 @@ async fn create_session(
     }
 }
 
+#[cfg(test)]
 async fn register_session(
     broker: &BrokerState,
     allowed_origin: String,
     output_root: PathBuf,
     browser_control_enabled: bool,
 ) -> Result<SessionCreated> {
-    let mut sessions = broker.sessions.lock().await;
-    let session_id = allocate_session_id(&sessions)?;
+    register_session_with_runtime(
+        broker,
+        allowed_origin,
+        output_root,
+        browser_control_enabled,
+        None,
+    )
+    .await
+}
+
+async fn register_session_with_runtime(
+    broker: &BrokerState,
+    allowed_origin: String,
+    output_root: PathBuf,
+    browser_control_enabled: bool,
+    runtime_config: Option<RuntimeLaunchConfig>,
+) -> Result<SessionCreated> {
+    let session_id = {
+        let sessions = broker.sessions.lock().await;
+        allocate_session_id(&sessions)?
+    };
     let endpoint = format!("{}/{}", broker.endpoint, session_id);
     let widget_url = format!("{endpoint}/widget.js");
-    sessions.insert(
-        session_id.clone(),
-        SessionState {
-            allowed_origin,
-            endpoint,
-            session_id: session_id.clone(),
-            browser_token: capability_token(),
-            output: output_root.join(&session_id),
-            conversation: Arc::new(Mutex::new(Conversation::default())),
-            reply_assets: Arc::new(Mutex::new(HashMap::new())),
-            inbound_notify: Arc::new(Notify::new()),
-            transcript_notify: Arc::new(Notify::new()),
-            browser_control_enabled,
-            browser_control: Arc::new(Mutex::new(BrowserControlState::default())),
-            browser_command_notify: Arc::new(Notify::new()),
-            ended: Arc::new(AtomicBool::new(false)),
-        },
-    );
+    let output = output_root.join(&session_id);
+    let session = SessionState {
+        allowed_origin,
+        endpoint,
+        session_id: session_id.clone(),
+        browser_token: capability_token(),
+        transcript_path: output.join("transcript.json"),
+        output,
+        started_at_unix_ms: unix_time_ms()?,
+        conversation: Arc::new(Mutex::new(Conversation::default())),
+        reply_assets: Arc::new(Mutex::new(HashMap::new())),
+        inbound_notify: Arc::new(Notify::new()),
+        transcript_notify: Arc::new(Notify::new()),
+        browser_control_enabled,
+        browser_control: Arc::new(Mutex::new(BrowserControlState::default())),
+        browser_command_notify: Arc::new(Notify::new()),
+        runtime: Arc::new(Mutex::new(None)),
+        completion_notify: Arc::new(Notify::new()),
+        ended: Arc::new(AtomicBool::new(false)),
+    };
+    {
+        let mut sessions = broker.sessions.lock().await;
+        if sessions.contains_key(&session_id) {
+            bail!("the selected AgentNudge session word became unavailable; retry");
+        }
+        sessions.insert(session_id.clone(), session.clone());
+    }
+    broker.completed_sessions.lock().await.remove(&session_id);
+
+    let runtime = if let Some(mut config) = runtime_config {
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "agentnudge".into());
+        config.context = format!(
+            "AgentNudge session handle: {session_id}. AgentNudge CLI: {executable}. If this session allows browser control, use `agentnudge browser {session_id} ...` (or the absolute CLI path above) to inspect, change, and reload the connected page.\n\n{}",
+            config.context
+        );
+        match crate::runtime::start(config).await {
+            Ok((handle, events)) => {
+                *session.runtime.lock().await = Some(handle.clone());
+                spawn_runtime_event_listener(session.clone(), events);
+                Some(handle.snapshot().await)
+            }
+            Err(error) => {
+                broker.sessions.lock().await.remove(&session_id);
+                return Err(error.context("could not start the embedded agent runtime"));
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = persist_active_transcript(&session).await {
+        if let Some(runtime) = session.runtime.lock().await.clone() {
+            let _ = runtime.shutdown().await;
+        }
+        broker.sessions.lock().await.remove(&session_id);
+        return Err(error.context("could not initialize the session transcript"));
+    }
     Ok(SessionCreated {
         version: PROTOCOL_VERSION,
         status: "ready".into(),
@@ -561,6 +740,7 @@ async fn register_session(
         script_tag: format!("<script type=\"module\" src=\"{widget_url}\"></script>"),
         widget_url,
         browser_control_enabled,
+        runtime,
     })
 }
 
@@ -576,26 +756,86 @@ async fn delete_session(
         Ok(value) => value,
         Err(error) => return agent_bad_request(error.to_string()),
     };
-    let removed = state.sessions.lock().await.remove(&session_id);
-    let Some(session) = removed else {
+    match finish_session(&state, &session_id).await {
+        Ok(transcript) => (
+            StatusCode::OK,
+            Json(EndSessionReceipt {
+                version: PROTOCOL_VERSION,
+                status: "ended".into(),
+                session: session_id,
+                transcript,
+            }),
+        )
+            .into_response(),
+        Err(error) => agent_bad_request(error.to_string()),
+    }
+}
+
+async fn agent_transcript(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !valid_agent_token(&state, &headers) {
+        return agent_unauthorized();
+    }
+    match current_transcript(&state, &session_id).await {
+        Some(transcript) => (StatusCode::OK, Json(transcript)).into_response(),
+        None => agent_not_found(&session_id),
+    }
+}
+
+async fn agent_completion(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Query(query): Query<WaitQuery>,
+) -> Response<Body> {
+    if !valid_agent_token(&state, &headers) {
+        return agent_unauthorized();
+    }
+    let duration = Duration::from_millis(query.timeout_ms).min(COMPLETION_POLL);
+    if let Some(transcript) = state
+        .completed_sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    {
+        return completion_response(&session_id, "ended", Some(transcript));
+    }
+    let Some(session) = find_session(&state, &session_id).await else {
         return agent_not_found(&session_id);
     };
-    session.ended.store(true, Ordering::Release);
-    {
-        let mut browser = session.browser_control.lock().await;
-        browser.commands.clear();
-        browser.pending.clear();
-        browser.pages.clear();
+    let notified = session.completion_notify.notified();
+    if !session.ended.load(Ordering::Acquire) {
+        let _ = tokio::time::timeout(duration, notified).await;
     }
-    session.inbound_notify.notify_waiters();
-    session.transcript_notify.notify_waiters();
-    session.browser_command_notify.notify_waiters();
+    if let Some(transcript) = state
+        .completed_sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    {
+        completion_response(&session_id, "ended", Some(transcript))
+    } else {
+        completion_response(&session_id, "active", None)
+    }
+}
+
+fn completion_response(
+    session_id: &str,
+    status: &str,
+    transcript: Option<SessionTranscript>,
+) -> Response<Body> {
     (
         StatusCode::OK,
-        Json(EndSessionReceipt {
+        Json(SessionCompletionResponse {
             version: PROTOCOL_VERSION,
-            status: "ended".into(),
-            session: session_id,
+            status: status.into(),
+            session: session_id.into(),
+            transcript,
         }),
     )
         .into_response()
@@ -842,6 +1082,7 @@ async fn record_agent_reply(
         sequence
     };
     state.transcript_notify.notify_waiters();
+    persist_active_transcript(state).await?;
     Ok(ReplyReceipt {
         version: PROTOCOL_VERSION,
         status: "accepted".into(),
@@ -1394,6 +1635,17 @@ async fn submit_message(
         attachments: submission.attachments,
         image_attachments: vec![],
     };
+    let runtime_message = RuntimeUserMessage {
+        message_id: inbound.message_id.clone(),
+        text: inbound.text.clone(),
+        manifest_path: inbound.manifest_path.clone(),
+        screenshot_path: inbound.screenshot_path.clone(),
+        attachment_summaries: inbound
+            .attachments
+            .iter()
+            .map(|attachment| attachment.summary.clone())
+            .collect(),
+    };
     {
         let mut conversation = session.conversation.lock().await;
         conversation.messages.push(chat_message);
@@ -1401,6 +1653,21 @@ async fn submit_message(
     }
     session.inbound_notify.notify_waiters();
     session.transcript_notify.notify_waiters();
+    if let Some(runtime) = session.runtime.lock().await.clone()
+        && let Err(error) = runtime.send_user_message(runtime_message).await
+    {
+        let _ = record_agent_reply(
+            &session,
+            PreparedAgentReply {
+                message: format!("Embedded agent runtime error: {error}"),
+                in_reply_to: Some(message_id.clone()),
+                attachments: vec![],
+            },
+        )
+        .await;
+    } else {
+        let _ = persist_active_transcript(&session).await;
+    }
 
     cors_json(
         &session.allowed_origin,
@@ -1465,8 +1732,173 @@ async fn conversation(
     }
 }
 
+async fn browser_end_session(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    match finish_session(&state, &session_id).await {
+        Ok(_transcript) => cors_json(
+            &session.allowed_origin,
+            StatusCode::OK,
+            &BrowserEndSessionReceipt {
+                version: PROTOCOL_VERSION,
+                status: "ended".into(),
+                session: session_id,
+            },
+        ),
+        Err(error) => json_response(
+            &session.allowed_origin,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "end_session_failed", "message": error.to_string()}),
+        ),
+    }
+}
+
 async fn find_session(state: &BrokerState, session_id: &str) -> Option<SessionState> {
     state.sessions.lock().await.get(session_id).cloned()
+}
+
+fn spawn_runtime_event_listener(
+    session: SessionState,
+    mut events: tokio::sync::mpsc::Receiver<RuntimeEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if session.ended.load(Ordering::Acquire) {
+                break;
+            }
+            let message = match event {
+                RuntimeEvent::AssistantMessage(message) => message,
+                RuntimeEvent::Error(message) => format!("Embedded agent runtime error: {message}"),
+            };
+            if let Err(error) = record_agent_reply(
+                &session,
+                PreparedAgentReply {
+                    message,
+                    in_reply_to: None,
+                    attachments: vec![],
+                },
+            )
+            .await
+            {
+                eprintln!(
+                    "AgentNudge could not record embedded agent output for {}: {error:#}",
+                    session.session_id
+                );
+            }
+        }
+    });
+}
+
+async fn current_transcript(state: &BrokerState, session_id: &str) -> Option<SessionTranscript> {
+    if let Some(session) = find_session(state, session_id).await {
+        return Some(build_transcript(&session, "active", None).await);
+    }
+    state
+        .completed_sessions
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+}
+
+async fn build_transcript(
+    session: &SessionState,
+    status: &str,
+    ended_at_unix_ms: Option<u128>,
+) -> SessionTranscript {
+    let messages = session.conversation.lock().await.messages.clone();
+    let runtime = match session.runtime.lock().await.clone() {
+        Some(handle) => Some(handle.snapshot().await),
+        None => None,
+    };
+    SessionTranscript {
+        version: PROTOCOL_VERSION,
+        status: status.into(),
+        session: session.session_id.clone(),
+        started_at_unix_ms: session.started_at_unix_ms,
+        ended_at_unix_ms,
+        runtime,
+        messages,
+        transcript_path: session.transcript_path.display().to_string(),
+    }
+}
+
+async fn persist_active_transcript(session: &SessionState) -> Result<SessionTranscript> {
+    let transcript = build_transcript(session, "active", None).await;
+    write_private_json_atomic(&session.transcript_path, &transcript)?;
+    Ok(transcript)
+}
+
+async fn finish_session(state: &BrokerState, session_id: &str) -> Result<SessionTranscript> {
+    if let Some(transcript) = state
+        .completed_sessions
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+    {
+        return Ok(transcript);
+    }
+    let session = find_session(state, session_id)
+        .await
+        .with_context(|| format!("AgentNudge session `{session_id}` is not active"))?;
+    let notified = session.completion_notify.notified();
+    if session.ended.swap(true, Ordering::AcqRel) {
+        notified.await;
+        return state
+            .completed_sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .context("the AgentNudge session ended without a transcript");
+    }
+
+    if let Some(runtime) = session.runtime.lock().await.clone()
+        && let Err(error) = runtime.shutdown().await
+    {
+        eprintln!("AgentNudge embedded runtime shutdown warning for {session_id}: {error:#}");
+    }
+    {
+        let mut browser = session.browser_control.lock().await;
+        browser.commands.clear();
+        browser.pending.clear();
+        browser.pages.clear();
+    }
+    let transcript = build_transcript(&session, "ended", Some(unix_time_ms()?)).await;
+    if let Err(error) = write_private_json_atomic(&session.transcript_path, &transcript) {
+        eprintln!("AgentNudge could not persist the final transcript for {session_id}: {error:#}");
+    }
+    state
+        .completed_sessions
+        .lock()
+        .await
+        .insert(session_id.into(), transcript.clone());
+    state.sessions.lock().await.remove(session_id);
+
+    session.inbound_notify.notify_waiters();
+    session.transcript_notify.notify_waiters();
+    session.browser_command_notify.notify_waiters();
+    session.completion_notify.notify_waiters();
+    Ok(transcript)
+}
+
+fn validate_runtime_config(config: &RuntimeLaunchConfig) -> Result<()> {
+    if !config.cwd.is_absolute() || !config.cwd.is_dir() {
+        bail!("the runtime workspace must be an existing absolute directory");
+    }
+    if config.context.chars().count() > MAX_RUNTIME_CONTEXT_CHARS {
+        bail!("runtime context exceeds {MAX_RUNTIME_CONTEXT_CHARS} characters");
+    }
+    Ok(())
 }
 
 async fn wait_on_session(state: &SessionState, duration: Duration) -> WaitResponse {
@@ -2052,7 +2484,7 @@ fn apply_cors_headers(response: &mut Response<Body>, origin: &str) {
     headers.insert(VARY, HeaderValue::from_static("Origin"));
     headers.insert(
         ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, OPTIONS"),
+        HeaderValue::from_static("GET, POST, DELETE, OPTIONS"),
     );
     headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
@@ -2261,6 +2693,34 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+fn write_private_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("the private JSON path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("could not create {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("private.json");
+    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| -> Result<()> {
+        write_private_json(&temporary, value)?;
+        std::fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "could not atomically replace {} with {}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
 fn remove_descriptor_if_owned(path: &Path, token: &str) {
     let owned = std::fs::read(path)
         .ok()
@@ -2407,6 +2867,8 @@ mod tests {
             session_id: String::new(),
             browser_token: String::new(),
             output: PathBuf::new(),
+            transcript_path: PathBuf::new(),
+            started_at_unix_ms: 0,
             conversation: Arc::new(Mutex::new(Conversation::default())),
             reply_assets: Arc::new(Mutex::new(HashMap::new())),
             inbound_notify: Arc::new(Notify::new()),
@@ -2414,6 +2876,8 @@ mod tests {
             browser_control_enabled: false,
             browser_control: Arc::new(Mutex::new(BrowserControlState::default())),
             browser_command_notify: Arc::new(Notify::new()),
+            runtime: Arc::new(Mutex::new(None)),
+            completion_notify: Arc::new(Notify::new()),
             ended: Arc::new(AtomicBool::new(false)),
         };
         for word in NATO_WORDS {
@@ -3198,5 +3662,83 @@ mod tests {
         assert_eq!(ended.status(), StatusCode::OK);
         let response: BrowserActionResponse = response_json(action_task.await.unwrap()).await;
         assert_eq!(response.status, "ended");
+    }
+
+    #[tokio::test]
+    async fn browser_close_persists_a_final_transcript_for_agent_queries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        let submitted = submit_message(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(submission(&created.session)),
+        )
+        .await;
+        assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+        record_agent_reply(
+            &session,
+            PreparedAgentReply {
+                message: "I can move that button.".into(),
+                in_reply_to: None,
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let active = agent_transcript(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            agent_headers(&broker),
+        )
+        .await;
+        let active: SessionTranscript = response_json(active).await;
+        assert_eq!(active.status, "active");
+        assert_eq!(active.messages.len(), 2);
+
+        let ended = browser_end_session(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+        )
+        .await;
+        assert_eq!(ended.status(), StatusCode::OK);
+        let ended: serde_json::Value = response_json(ended).await;
+        assert_eq!(ended["status"], "ended");
+        assert!(ended.get("transcript").is_none());
+        assert!(ended.get("transcriptPath").is_none());
+        assert!(find_session(&broker, &created.session).await.is_none());
+
+        let archived = agent_transcript(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            agent_headers(&broker),
+        )
+        .await;
+        let archived: SessionTranscript = response_json(archived).await;
+        assert_eq!(archived.status, "ended");
+        assert_eq!(archived.messages.len(), 2);
+        assert!(Path::new(&archived.transcript_path).is_file());
+
+        let completion = agent_completion(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            agent_headers(&broker),
+            Query(WaitQuery { timeout_ms: 0 }),
+        )
+        .await;
+        let completion: SessionCompletionResponse = response_json(completion).await;
+        assert_eq!(completion.status, "ended");
+        assert_eq!(completion.transcript.unwrap().session, created.session);
     }
 }

@@ -1,15 +1,18 @@
 mod execution;
 mod model;
+mod runtime;
 mod server;
 
 use std::ffi::OsString;
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use model::BrowserAction;
+use runtime::{RuntimeAdapterKind, RuntimeLaunchConfig};
 use server::{BrokerConfig, SessionConfig};
 use url::Url;
 
@@ -18,7 +21,7 @@ use url::Url;
     name = "agentnudge",
     version,
     about = "Chat with a coding agent from the UI it is building",
-    long_about = "AgentNudge runs isolated local chat sessions. Page elements, regions, and drawings become visual attachments delivered through timed foreground waits to coding agents."
+    long_about = "AgentNudge runs isolated local chat sessions. Page elements, regions, and drawings become visual attachments delivered through foreground waits or an embedded coding-agent runtime."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,7 +48,7 @@ enum Command {
         command: Vec<OsString>,
     },
 
-    /// Create an isolated local chat session and return its short ID.
+    /// Print a new session's short ID, then wait until the session closes.
     Session {
         /// Exact browser origin allowed to use the widget.
         #[arg(long, default_value = "http://localhost:5173")]
@@ -58,6 +61,26 @@ enum Command {
         /// Explicitly allow this session's agent to control connected preview pages.
         #[arg(long)]
         allow_browser_control: bool,
+
+        /// Start an embedded coding-agent runtime for this page conversation.
+        #[arg(long, value_enum)]
+        runtime: Option<RuntimeArgument>,
+
+        /// Trusted context supplied by the agent starting the embedded runtime.
+        #[arg(long, conflicts_with = "context_file")]
+        context: Option<String>,
+
+        /// Read trusted embedded-agent context from a UTF-8 file.
+        #[arg(long, value_name = "PATH", conflicts_with = "context")]
+        context_file: Option<PathBuf>,
+
+        /// Workspace used as the embedded coding agent's working directory.
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+
+        /// Alternate Codex executable, primarily for adapter testing.
+        #[arg(long, value_name = "PATH", requires = "runtime")]
+        codex_bin: Option<PathBuf>,
     },
 
     /// Inspect and control a connected preview page through typed actions.
@@ -109,6 +132,12 @@ enum Command {
         session: String,
     },
 
+    /// Return the complete live or final conversation transcript.
+    Transcript {
+        /// Short session ID returned by `agentnudge session`.
+        session: String,
+    },
+
     /// Internal persistent broker process.
     #[command(hide = true)]
     Broker {
@@ -118,6 +147,11 @@ enum Command {
         #[arg(long)]
         descriptor_file: PathBuf,
     },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum RuntimeArgument {
+    Codex,
 }
 
 #[derive(Debug, Subcommand)]
@@ -214,14 +248,25 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             origin,
             output,
             allow_browser_control,
+            runtime,
+            context,
+            context_file,
+            workspace,
+            codex_bin,
         } => {
+            let runtime =
+                build_runtime_config(runtime, context, context_file, workspace, codex_bin)?;
             let created = server::start_session(SessionConfig {
                 origin,
                 output,
                 allow_browser_control,
+                runtime,
             })
             .await?;
             println!("{}", serde_json::to_string(&created)?);
+            std::io::stdout().flush()?;
+            let transcript = server::wait_for_session_end(&created.session).await?;
+            println!("{}", serde_json::to_string(&transcript)?);
             Ok(ExitCode::SUCCESS)
         }
         Command::Browser {
@@ -321,6 +366,11 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             println!("{}", serde_json::to_string(&receipt)?);
             Ok(ExitCode::SUCCESS)
         }
+        Command::Transcript { session } => {
+            let transcript = server::session_transcript(&session).await?;
+            println!("{}", serde_json::to_string(&transcript)?);
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Broker {
             port,
             descriptor_file,
@@ -333,6 +383,52 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+fn build_runtime_config(
+    runtime: Option<RuntimeArgument>,
+    context: Option<String>,
+    context_file: Option<PathBuf>,
+    workspace: PathBuf,
+    executable: Option<PathBuf>,
+) -> anyhow::Result<Option<RuntimeLaunchConfig>> {
+    let Some(runtime) = runtime else {
+        if context.is_some() || context_file.is_some() || executable.is_some() {
+            bail!("--context, --context-file, and --codex-bin require --runtime codex");
+        }
+        return Ok(None);
+    };
+    let context = match (context, context_file) {
+        (Some(value), None) => value,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("could not read runtime context {}", path.display()))?,
+        (None, None) => String::new(),
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting context sources"),
+    };
+    let cwd = std::fs::canonicalize(&workspace).with_context(|| {
+        format!(
+            "could not resolve runtime workspace {}",
+            workspace.display()
+        )
+    })?;
+    if !cwd.is_dir() {
+        bail!("runtime workspace {} is not a directory", cwd.display());
+    }
+    let adapter = match runtime {
+        RuntimeArgument::Codex => RuntimeAdapterKind::Codex,
+    };
+    let executable = executable
+        .map(|path| {
+            std::fs::canonicalize(&path)
+                .with_context(|| format!("could not resolve Codex executable {}", path.display()))
+        })
+        .transpose()?;
+    Ok(Some(RuntimeLaunchConfig {
+        adapter,
+        context,
+        cwd,
+        executable,
+    }))
 }
 
 async fn print_browser_result(
@@ -458,6 +554,25 @@ mod tests {
                 .unwrap()
                 .command,
             Command::EndSession { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["agentnudge", "transcript", "lima"])
+                .unwrap()
+                .command,
+            Command::Transcript { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "agentnudge",
+                "session",
+                "--runtime",
+                "codex",
+                "--context",
+                "Focus on the demo"
+            ])
+            .unwrap()
+            .command,
+            Command::Session { .. }
         ));
     }
 }

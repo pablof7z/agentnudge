@@ -2,15 +2,42 @@
 
 AgentNudge is a tiny local chat bridge between a person looking at software and the coding agent working on it.
 
-A development-only message button opens a sidebar directly in the website. You can ask the agent a question or request a change, and attach page elements, rectangular regions, or freehand drawings to the message. The agent receives the text, structured attachment metadata, and an annotated screenshot when a timed foreground CLI command completes. Its reply appears back in the sidebar.
+A development-only message button opens a sidebar directly in the website. You can ask the agent a question or request a change, and attach page elements, rectangular regions, or freehand drawings to the message. AgentNudge can wake the current harness through a foreground wait, or route the conversation through a per-session Codex app-server whose replies appear directly in the sidebar.
 
-No account, hosted service, browser extension, or multi-computer transport is involved in this version.
+The local/manual bridge needs no account, hosted service, browser extension, or multi-computer transport. Embedded Codex mode uses the machine's existing Codex installation and authentication.
 
 ## Agent skill
 
 Reusable agent instructions live in [`skills/agentnudge`](skills/agentnudge). Install or reference that folder from an agent's skill directory, then invoke `$agentnudge` to add and operate the local feedback loop.
 
-## The agent loop
+## Embedded agent chat
+
+Start a session with Codex app-server as its embedded runtime:
+
+```sh
+agentnudge session \
+  --origin http://localhost:5173 \
+  --runtime codex \
+  --workspace "$PWD" \
+  --context "Work on this preview and explain each completed change." \
+  --allow-browser-control
+```
+
+The command prints the ready record, then remains in the foreground. Keep its process handle. Each browser message is sent to this session's private app-server thread; if Codex is already working, AgentNudge uses `turn/steer` to inject the message into that active turn. Completed Codex messages appear in the sidebar.
+
+The trusted `--context` (or `--context-file`) is applied at `thread/start`. Browser messages, captures, manifests, and page text stay untrusted user input. The annotated screenshot is supplied to Codex as a local image along with its evidence paths.
+
+Inspect the complete ordered conversation without consuming anything:
+
+```sh
+agentnudge transcript lima
+```
+
+The sidebar X only hides chat. The adjacent end-session icon requires a confirming second click. It stops the runtime and releases the original foreground command with the final transcript and its durable `transcriptPath`. `agentnudge end-session lima` performs the same close from another agent terminal.
+
+The broker talks to embedded agents through a runtime command/event boundary. Codex JSON-RPC is isolated in its adapter so an ACP adapter can implement the same lifecycle later.
+
+## The manual agent loop
 
 Create an isolated session for the website's exact origin:
 
@@ -18,11 +45,11 @@ Create an isolated session for the website's exact origin:
 agentnudge session --origin http://localhost:5173 --allow-browser-control
 ```
 
-The command returns immediately with stable JSON:
+The command prints stable JSON, then remains in the foreground until the session ends:
 
 ```json
 {
-  "version": 9,
+  "version": 10,
   "status": "ready",
   "session": "lima",
   "widgetUrl": "http://127.0.0.1:4317/lima/widget.js",
@@ -31,7 +58,7 @@ The command returns immediately with stable JSON:
 }
 ```
 
-Load that exact session-specific script only in development, then have the agent wait in the foreground:
+Keep that session process handle, load the exact session-specific script only in development, then have the agent start a second foreground wait:
 
 ```sh
 agentnudge wait lima 10m
@@ -43,11 +70,11 @@ Sending a browser message completes the wait with JSON containing the message an
 
 ```json
 {
-  "version": 9,
+  "version": 10,
   "status": "message",
   "session": "lima",
   "message": {
-    "version": 9,
+    "version": 10,
     "sessionId": "lima",
     "messageId": "…",
     "sequence": 1,
@@ -98,7 +125,7 @@ agentnudge reply lima 0s \
 A wait without a message is a normal successful result:
 
 ```json
-{"version":9,"status":"timeout","session":"lima","waitedMs":600000}
+{"version":10,"status":"timeout","session":"lima","waitedMs":600000}
 ```
 
 Call `wait` again after a timeout. End the conversation explicitly when it is finished:
@@ -106,6 +133,8 @@ Call `wait` again after a timeout. End the conversation explicitly when it is fi
 ```sh
 agentnudge end-session lima
 ```
+
+The original `session` process then exits with the complete final transcript.
 
 ## Run code
 
@@ -153,9 +182,9 @@ The widget may execute only the typed actions above. Browser-authenticated route
 
 ## Concurrent agents
 
-One persistent broker listens only on `127.0.0.1:4317` and owns all active local sessions. `agentnudge session` starts it automatically when necessary.
+One persistent broker listens only on `127.0.0.1:4317` and owns all active local sessions. `agentnudge session` starts it automatically when necessary and remains foreground-owned until that session closes.
 
-Every active session receives one unused NATO phonetic word such as `lima`, `bravo`, or `zulu`. The session word is passed explicitly to `wait`, `reply`, and `end-session`, and it is also part of the widget URL. Each word has an isolated origin, browser capability, queue, transcript, and evidence directory, so two agents on the same computer do not consume one another's messages. Ending a session releases its word for reuse.
+Every active session receives one unused NATO phonetic word such as `lima`, `bravo`, or `zulu`. The session word is passed explicitly to `wait`, `reply`, `transcript`, browser commands, and `end-session`, and it is also part of the widget URL. Each word has an isolated origin, browser capability, queue, runtime, transcript, and evidence directory, so two agents on the same computer do not consume one another's messages. Ending a session releases its word for reuse.
 
 The short word is a routing handle, not a secret. The broker keeps its agent capability in a private per-user runtime descriptor. The page receives a different unguessable browser capability, scoped to the session and exact allowed origin, that can submit messages, read only that transcript, poll agent-authored actions, and submit untrusted action results. Application JavaScript cannot author agent replies, browser actions, or local execution requests.
 
@@ -172,7 +201,7 @@ cargo build
 python3 -m http.server 5173 --directory examples/demo
 ```
 
-Create a session:
+Create a session in one terminal and leave it running:
 
 ```sh
 target/debug/agentnudge session --origin http://localhost:5173 --allow-browser-control
@@ -241,7 +270,7 @@ The generated `web/dist/widget.js` is checked in so installing the Rust binary d
 
 ## Scope
 
-This release remains local and web-first. Browser-wide CDP control, remote previews, phones, Nostr transport, native macOS/iOS adapters, raw page evaluation, console capture, network capture, storage capture, and full-DOM capture are deferred. Connected-page control deliberately stays inside the exact-origin development widget.
+This release remains local and web-first. Codex app-server is the first embedded-agent adapter; ACP, browser-wide CDP control, remote previews, phones, Nostr transport, native macOS/iOS adapters, raw page evaluation, console capture, network capture, storage capture, and full-DOM capture are deferred. Connected-page control deliberately stays inside the exact-origin development widget.
 
 ## License
 

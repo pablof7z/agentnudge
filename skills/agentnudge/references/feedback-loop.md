@@ -12,7 +12,7 @@ agentnudge session --origin http://localhost:5173
 
 Add `--allow-browser-control` only when the agent needs to operate the connected preview. Browser actions remain unavailable in sessions that were not explicitly armed.
 
-The command returns immediately with JSON containing `session`, `widgetUrl`, and `scriptTag`. The session is a short NATO word such as `lima`. Pass it explicitly to every later command; it prevents concurrent local agents from consuming one another's messages. It is a routing handle, not a secret.
+The command prints JSON containing `session`, `widgetUrl`, and `scriptTag`, then remains in the foreground until the session ends. Retain its process handle. The session is a short NATO word such as `lima`; pass it explicitly to every later command. It is a routing handle, not a secret.
 
 ## Wait for feedback
 
@@ -58,3 +58,5 @@ agentnudge end-session lima
 ```
 
 Ending releases the short word and invalidates that widget session. Do this only when the feedback conversation is actually complete.
+
+The original foreground `session` process then returns the final ordered transcript and its durable `transcriptPath`.
