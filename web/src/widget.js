@@ -1,4 +1,19 @@
 import html2canvas from "html2canvas";
+import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
+import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
+import iconCheck from "@tabler/icons/outline/check.svg";
+import iconDots from "@tabler/icons/outline/dots.svg";
+import iconEdit from "@tabler/icons/outline/edit.svg";
+import iconMessage from "@tabler/icons/outline/message-dots.svg";
+import iconNote from "@tabler/icons/outline/note.svg";
+import iconPencil from "@tabler/icons/outline/pencil.svg";
+import iconReview from "@tabler/icons/outline/photo-check.svg";
+import iconPointer from "@tabler/icons/outline/pointer.svg";
+import iconQuote from "@tabler/icons/outline/quote.svg";
+import iconSelect from "@tabler/icons/outline/select.svg";
+import iconSend from "@tabler/icons/outline/send.svg";
+import iconTrash from "@tabler/icons/outline/trash.svg";
+import iconX from "@tabler/icons/outline/x.svg";
 
 const ENDPOINT = "__AGENTNUDGE_ENDPOINT__";
 const ALLOWED_ORIGIN = "__AGENTNUDGE_ORIGIN__";
@@ -7,103 +22,166 @@ const SESSION_TOKEN = "__AGENTNUDGE_TOKEN__";
 const HOST_ID = "agentnudge-widget";
 const INK_COLOR = "#dc5835";
 const INK_WIDTH = 4;
+const MAX_HISTORY = 80;
 
 const css = String.raw`
   :host {
+    --surface: #fbfaf6;
+    --surface-raised: #ffffff;
+    --surface-hover: #f0eee8;
+    --text: #20201e;
+    --muted: #716f68;
+    --border: #d6d3ca;
+    --accent: #dc5835;
+    --accent-soft: #fbe5dd;
+    --selection: #2563c7;
+    --sticky: #fff4b8;
+    --sticky-border: #c6a946;
     all: initial;
     position: fixed;
     inset: auto 18px 18px auto;
     z-index: 2147483647;
-    color: #1b1b1a;
+    color: var(--text);
     font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     font-size: 14px;
     line-height: 1.4;
   }
 
+  @media (prefers-color-scheme: dark) {
+    :host {
+      --surface: #20211f;
+      --surface-raised: #292a27;
+      --surface-hover: #353630;
+      --text: #f3f1ea;
+      --muted: #b8b5ac;
+      --border: #4c4d48;
+      --accent-soft: #593126;
+      --sticky: #4a421f;
+      --sticky-border: #8f7a30;
+    }
+  }
+
   * { box-sizing: border-box; }
   button, textarea { font: inherit; }
 
-  .launcher {
-    width: 38px;
-    height: 38px;
-    border: 1px solid #1b1b1a;
-    border-radius: 50%;
-    background: #fffdf7;
-    color: #1b1b1a;
-    cursor: pointer;
+  .dock {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    align-items: flex-end;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .tray {
+    width: min(334px, calc(100vw - 78px));
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    background: color-mix(in srgb, var(--surface) 94%, transparent);
+    box-shadow: 0 10px 34px rgb(20 20 18 / .18);
+    backdrop-filter: blur(14px) saturate(130%);
+    -webkit-backdrop-filter: blur(14px) saturate(130%);
+    opacity: 0;
+    transform: translateX(22px) scaleX(.88);
+    transform-origin: right bottom;
+    clip-path: inset(0 0 0 100% round 13px);
+    pointer-events: none;
+    transition: opacity 180ms ease, transform 260ms cubic-bezier(.2, .8, .2, 1), clip-path 260ms cubic-bezier(.2, .8, .2, 1);
+  }
+
+  .dock[data-open="true"] .tray {
+    opacity: 1;
+    transform: translateX(0) scaleX(1);
+    clip-path: inset(0 round 13px);
+    pointer-events: auto;
+  }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    min-width: 0;
+    padding: 6px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .toolbar::-webkit-scrollbar { display: none; }
+  .separator { width: 1px; height: 22px; flex: none; margin: 0 2px; background: var(--border); }
+
+  .icon-button, .launcher {
+    width: 34px;
+    height: 34px;
+    flex: none;
     display: grid;
     place-items: center;
-    box-shadow: 0 3px 14px rgba(20, 20, 18, .16);
-    font-weight: 750;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: background-color 120ms ease, color 120ms ease, transform 120ms ease;
   }
-
-  .launcher:hover { background: #f1ffb7; }
-  .launcher, .panel, .draw-toolbar { position: relative; z-index: 2; }
-  .launcher:focus-visible, button:focus-visible, textarea:focus-visible {
-    outline: 3px solid rgba(80, 98, 20, .35);
+  .icon-button:hover { background: var(--surface-hover); color: var(--text); }
+  .icon-button:active, .launcher:active { transform: scale(.96); }
+  .icon-button[data-active="true"] { background: var(--accent-soft); color: var(--accent); }
+  .icon-button:disabled { opacity: .32; cursor: default; }
+  .icon-button:disabled:hover { background: transparent; color: var(--muted); }
+  .icon-button:focus-visible, .launcher:focus-visible, textarea:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent) 72%, transparent);
     outline-offset: 2px;
   }
+  .icon-button svg, .launcher svg, .general-icon svg, .sticky-icon svg { width: 19px; height: 19px; display: block; }
 
-  .panel {
-    width: min(370px, calc(100vw - 28px));
-    max-height: min(680px, calc(100vh - 28px));
-    overflow: auto;
-    border: 1px solid #d8d5ca;
-    border-radius: 14px;
-    background: #fffdf7;
-    box-shadow: 0 10px 34px rgba(20, 20, 18, .2);
-    padding: 14px;
+  .launcher {
+    width: 42px;
+    height: 42px;
+    border: 1px solid var(--text);
+    border-radius: 50%;
+    background: var(--surface);
+    color: var(--text);
+    box-shadow: 0 4px 16px rgb(20 20 18 / .18);
   }
+  .launcher svg { transition: transform 220ms cubic-bezier(.2, .8, .2, 1); }
+  .dock[data-open="true"] .launcher svg { transform: rotate(-12deg) scale(.92); }
 
-  .panel[hidden], .launcher[hidden], .review[hidden],
-  .annotation-summary[hidden], .draw-toolbar[hidden] { display: none; }
-  .head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-  .title { font-size: 15px; font-weight: 760; letter-spacing: -.01em; }
-  .close { border: 0; background: transparent; cursor: pointer; color: #5d5b54; padding: 4px; }
-  .hint { margin: 6px 0 10px; color: #67645c; font-size: 12px; }
-
-  textarea {
+  .general-note {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    align-items: start;
+    gap: 2px;
+    border-top: 1px solid var(--border);
+    padding: 5px 8px 7px;
+  }
+  .general-icon { height: 26px; display: grid; place-items: center; color: var(--muted); }
+  .general-note textarea {
     display: block;
     width: 100%;
-    min-height: 76px;
-    resize: vertical;
-    border: 1px solid #c9c5b9;
-    border-radius: 9px;
-    background: white;
-    color: #1b1b1a;
-    padding: 9px 10px;
+    height: 26px;
+    min-height: 26px;
+    max-height: 96px;
+    resize: none;
+    overflow: hidden;
+    border: 0;
+    border-radius: 0;
+    padding: 3px 2px;
+    background: transparent;
+    color: var(--text);
+    line-height: 20px;
+    transition: height 180ms ease;
   }
+  .general-note textarea:focus { overflow-y: auto; }
 
-  .field-label { display: block; margin: 0 0 6px; color: #67645c; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; }
-  .tools, .actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 10px; }
-  button.tool, button.secondary, button.primary, button.remove-sticky {
-    border-radius: 999px;
-    padding: 7px 10px;
-    cursor: pointer;
-    border: 1px solid #c9c5b9;
-    background: #fff;
-    color: #1b1b1a;
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
-  button.tool:hover, button.secondary:hover, button.remove-sticky:hover { background: #f3f0e7; }
-  button.tool[data-active="true"] { border-color: #536514; background: #f1ffb7; }
-  button.primary { border-color: #1b1b1a; background: #1b1b1a; color: white; margin-left: auto; }
-  button.primary:hover { background: #363632; }
-  button:disabled { cursor: default; opacity: .55; }
-
-  .annotation-summary {
-    margin-top: 10px;
-    padding: 9px 10px;
-    border-left: 3px solid #a4c238;
-    background: #f5f8e8;
-    color: #3e4721;
-    font-size: 12px;
-  }
-
-  .status { min-height: 18px; margin: 8px 0 0; color: #67645c; font-size: 12px; }
-  .status[data-error="true"] { color: #a12b20; }
-  .review { margin-top: 10px; }
-  .review img { display: block; width: 100%; border: 1px solid #d8d5ca; border-radius: 9px; background: #eee; }
-  .review-note { margin: 7px 0 0; color: #67645c; font-size: 11px; }
 
   .overlay {
     position: fixed;
@@ -114,167 +192,179 @@ const css = String.raw`
     z-index: 1;
   }
   .overlay svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
-  .hover-box { fill: rgba(164, 194, 56, .12); stroke: #61751a; stroke-width: 2; stroke-dasharray: 6 4; }
-  .pending-box { fill: rgba(239, 111, 67, .10); stroke: #dc5835; stroke-width: 3; }
-  .annotation-box { fill: rgba(239, 111, 67, .08); stroke: #dc5835; stroke-width: 2.5; }
-  .annotation-pin { fill: #dc5835; stroke: white; stroke-width: 2; }
-  .annotation-number { fill: white; font: 800 11px ui-sans-serif, -apple-system, sans-serif; text-anchor: middle; dominant-baseline: central; }
+  .hover-box { fill: rgb(164 194 56 / .10); stroke: #61751a; stroke-width: 2; stroke-dasharray: 6 4; }
+  .pending-box { fill: rgb(37 99 199 / .08); stroke: var(--selection); stroke-width: 2; stroke-dasharray: 6 4; }
+  .annotation-box { fill: rgb(220 88 53 / .07); stroke: var(--accent); stroke-width: 2; }
+  .annotation-pin { fill: var(--accent); stroke: var(--surface-raised); stroke-width: 2; }
+  .annotation-number { fill: #fffaf5; font: 800 11px ui-sans-serif, -apple-system, sans-serif; text-anchor: middle; dominant-baseline: central; }
   .drawing-stroke { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .drawing-selection { fill: none; stroke: var(--selection); stroke-linecap: round; stroke-linejoin: round; stroke-dasharray: 5 4; opacity: .8; }
 
   .sticky-layer { position: absolute; inset: 0; pointer-events: none; }
   .sticky-card {
     position: fixed;
     width: min(230px, calc(100vw - 24px));
-    padding: 10px 11px;
-    border: 1px solid #c6a946;
+    padding: 9px 10px 10px;
+    border: 1px solid var(--sticky-border);
     border-radius: 9px;
-    background: #fff4b8;
-    color: #292511;
-    box-shadow: 0 5px 18px rgba(45, 38, 10, .18);
+    background: var(--sticky);
+    color: var(--text);
+    box-shadow: 0 5px 18px rgb(45 38 10 / .18);
     pointer-events: auto;
   }
-  .sticky-head { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
-  .sticky-number { width: 22px; height: 22px; display: grid; place-items: center; flex: none; border-radius: 50%; background: #dc5835; color: white; font-size: 11px; font-weight: 800; }
-  .sticky-target { min-width: 0; flex: 1; color: #776a2a; font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .sticky-message { font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; white-space: pre-wrap; }
-  .sticky-card textarea { min-height: 86px; resize: vertical; border-color: #c6a946; background: #fffdf1; }
-  .sticky-card .actions { margin-top: 7px; }
-  button.remove-sticky { border: 0; padding: 2px 4px; background: transparent; color: #776a2a; font-size: 11px; }
-
-  .mode-pill {
-    position: fixed;
-    left: 50%;
-    top: 18px;
-    transform: translateX(-50%);
-    padding: 7px 11px;
-    border: 1px solid #1b1b1a;
-    border-radius: 999px;
-    background: #fffdf7;
-    color: #1b1b1a;
-    box-shadow: 0 3px 14px rgba(20, 20, 18, .16);
-    font-size: 12px;
-    font-weight: 680;
-  }
-  .mode-pill[hidden] { display: none; }
-
-  .draw-toolbar {
-    position: fixed;
-    left: 50%;
-    top: 18px;
-    transform: translateX(-50%);
+  .sticky-head {
     display: flex;
     align-items: center;
-    gap: 7px;
-    padding: 6px;
-    border: 1px solid #1b1b1a;
-    border-radius: 999px;
-    background: #fffdf7;
-    box-shadow: 0 3px 14px rgba(20, 20, 18, .16);
-    pointer-events: auto;
+    gap: 6px;
+    min-height: 24px;
+    margin: -3px -3px 5px;
+    padding: 3px;
+    cursor: grab;
+    touch-action: none;
   }
-  .draw-toolbar span { padding: 0 5px 0 7px; font-size: 12px; font-weight: 750; }
-  .draw-toolbar button { margin: 0; }
+  .sticky-head:active { cursor: grabbing; }
+  .sticky-number { width: 22px; height: 22px; display: grid; place-items: center; flex: none; border-radius: 50%; background: var(--accent); color: #fffaf5; font-size: 11px; font-weight: 800; }
+  .sticky-target { min-width: 0; flex: 1; color: color-mix(in srgb, var(--text) 68%, transparent); font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sticky-icon { width: 25px; height: 25px; display: grid; place-items: center; flex: none; border: 0; border-radius: 6px; padding: 0; background: transparent; color: color-mix(in srgb, var(--text) 66%, transparent); cursor: pointer; }
+  .sticky-icon:hover { background: color-mix(in srgb, var(--text) 9%, transparent); color: var(--text); }
+  .sticky-icon svg { width: 16px; height: 16px; }
+  .sticky-message { font-size: 12px; line-height: 1.42; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .sticky-card textarea {
+    display: block;
+    width: 100%;
+    min-height: 82px;
+    resize: vertical;
+    border: 0;
+    border-radius: 6px;
+    padding: 7px 8px;
+    background: color-mix(in srgb, var(--surface-raised) 76%, transparent);
+    color: var(--text);
+    line-height: 1.4;
+  }
+  .sticky-card[data-error="true"] textarea { outline: 2px solid var(--accent); }
+  .sticky-actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: 6px; }
+
+  .review-popover {
+    position: fixed;
+    right: 18px;
+    bottom: 72px;
+    width: min(360px, calc(100vw - 36px));
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: 0 14px 44px rgb(20 20 18 / .24);
+    z-index: 2;
+  }
+  .review-popover[hidden] { display: none; }
+  .review-popover img { display: block; width: 100%; max-height: min(62vh, 520px); object-fit: contain; border-radius: 7px; background: var(--surface-hover); }
+  .review-actions { display: flex; justify-content: flex-end; gap: 4px; margin-top: 6px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tray, .launcher svg, .icon-button, .general-note textarea { transition: none; }
+  }
 `;
 
 class AgentNudgeWidget extends HTMLElement {
   constructor() {
     super();
+    this.opened = false;
     this.mode = "idle";
     this.comments = [];
     this.strokes = [];
     this.commentCounter = 0;
-    this.draftSelection = null;
-    this.draftElement = null;
-    this.draftPosition = null;
-    this.draftMessage = "";
+    this.strokeCounter = 0;
+    this.selectedStrokeIds = new Set();
+    this.undoStack = [];
+    this.redoStack = [];
+    this.generalBeforeEdit = null;
+    this.draft = null;
+    this.editingCommentId = null;
+    this.editingMessage = "";
     this.hoverRect = null;
+    this.pendingRect = null;
     this.dragStart = null;
     this.pointerTarget = null;
     this.currentStroke = null;
     this.preview = null;
     this.suppressNextClick = false;
+    this.sent = false;
     this.abort = new AbortController();
 
     const root = this.attachShadow({ mode: "open" });
     root.innerHTML = `
       <style>${css}</style>
-      <button class="launcher" type="button" aria-label="Open AgentNudge feedback">N</button>
-      <section class="panel" role="dialog" aria-label="Send feedback to the working agent" hidden>
-        <div class="head">
-          <div class="title">Comment on this page</div>
-          <button class="close" type="button" aria-label="Close feedback">Close</button>
-        </div>
-        <p class="hint">Attach comments to anything on the page, draw directly over it, then send everything together.</p>
-        <label class="field-label" for="agentnudge-overall">Overall note (optional)</label>
-        <textarea id="agentnudge-overall" class="overall" maxlength="10000" placeholder="Anything the agent should know about the page as a whole…"></textarea>
-        <div class="tools" aria-label="Annotation tools">
-          <button class="tool comment-mode" type="button">Comments</button>
-          <button class="tool draw-mode" type="button">Draw</button>
-          <button class="secondary clear-all" type="button">Clear all</button>
-        </div>
-        <div class="annotation-summary" hidden></div>
-        <p class="status" aria-live="polite"></p>
-        <div class="actions compose-actions">
-          <button class="primary review-button" type="button">Review and send</button>
-        </div>
-        <div class="review" hidden>
-          <img alt="Exact annotated screenshot that will be shared with the agent">
-          <p class="review-note">Sticky notes and drawings are included exactly as shown. Inputs and marked redaction regions are masked.</p>
-          <div class="actions">
-            <button class="secondary back" type="button">Back</button>
-            <button class="primary send" type="button">Send all feedback</button>
+      <div class="dock" data-open="false">
+        <section class="tray" aria-label="AgentNudge annotation tools">
+          <div class="toolbar" role="toolbar" aria-label="Annotation modes">
+            ${iconButtonMarkup("select-mode", "Select drawing", iconPointer)}
+            ${iconButtonMarkup("sticky-mode", "Add sticky note", iconNote)}
+            ${iconButtonMarkup("draw-mode", "Draw", iconPencil)}
+            ${iconButtonMarkup("region-mode", "Select drawing region", iconSelect)}
+            <span class="separator" aria-hidden="true"></span>
+            ${iconButtonMarkup("undo", "Undo", iconUndo)}
+            ${iconButtonMarkup("redo", "Redo", iconRedo)}
+            ${iconButtonMarkup("delete-selection", "Delete selected drawing", iconTrash)}
+            <span class="separator" aria-hidden="true"></span>
+            ${iconButtonMarkup("review", "Review feedback", iconReview)}
           </div>
-        </div>
-      </section>
-      <div class="overlay" aria-hidden="true">
-        <svg>
+          <div class="general-note">
+            <span class="general-icon" title="General comment" aria-hidden="true">${iconQuote}</span>
+            <textarea rows="1" maxlength="10000" aria-label="General comment" title="General comment"></textarea>
+          </div>
+        </section>
+        <button class="launcher" type="button" aria-label="Open annotation toolbar" aria-expanded="false" title="Open annotation toolbar">${iconMessage}</button>
+      </div>
+      <div class="overlay">
+        <svg aria-hidden="true">
           <rect class="hover-box" visibility="hidden"></rect>
           <rect class="pending-box" visibility="hidden"></rect>
           <g class="annotation-layer"></g>
           <g class="drawing-layer"></g>
         </svg>
         <div class="sticky-layer"></div>
-        <div class="mode-pill" hidden></div>
       </div>
-      <div class="draw-toolbar" role="toolbar" aria-label="Drawing controls" hidden>
-        <span>Drawing</span>
-        <button class="secondary undo-stroke" type="button">Undo</button>
-        <button class="primary finish-drawing" type="button">Done</button>
-      </div>
+      <section class="review-popover" aria-label="Feedback screenshot preview" hidden>
+        <img alt="Annotated screenshot to send to the waiting agent">
+        <div class="review-actions">
+          ${iconButtonMarkup("close-review", "Close preview", iconX)}
+          ${iconButtonMarkup("send", "Send all feedback", iconSend, "primary")}
+        </div>
+      </section>
+      <p class="status sr-only" aria-live="polite"></p>
     `;
 
     this.root = root;
+    this.dock = root.querySelector(".dock");
     this.launcher = root.querySelector(".launcher");
-    this.panel = root.querySelector(".panel");
-    this.overall = root.querySelector(".overall");
-    this.annotationSummary = root.querySelector(".annotation-summary");
+    this.general = root.querySelector(".general-note textarea");
     this.status = root.querySelector(".status");
-    this.review = root.querySelector(".review");
-    this.previewImage = root.querySelector(".review img");
-    this.reviewButton = root.querySelector(".review-button");
-    this.sendButton = root.querySelector(".send");
     this.hoverBox = root.querySelector(".hover-box");
     this.pendingBox = root.querySelector(".pending-box");
     this.annotationLayer = root.querySelector(".annotation-layer");
     this.drawingLayer = root.querySelector(".drawing-layer");
     this.stickyLayer = root.querySelector(".sticky-layer");
-    this.modePill = root.querySelector(".mode-pill");
-    this.drawToolbar = root.querySelector(".draw-toolbar");
+    this.reviewPopover = root.querySelector(".review-popover");
+    this.previewImage = root.querySelector(".review-popover img");
   }
 
   connectedCallback() {
     const signal = this.abort.signal;
-    this.launcher.addEventListener("click", () => this.open(), { signal });
-    this.root.querySelector(".close").addEventListener("click", () => this.close(), { signal });
-    this.root.querySelector(".comment-mode").addEventListener("click", () => this.toggleCommentMode(), { signal });
-    this.root.querySelector(".draw-mode").addEventListener("click", () => this.beginDrawMode(), { signal });
-    this.root.querySelector(".clear-all").addEventListener("click", () => this.clearAll(), { signal });
-    this.root.querySelector(".undo-stroke").addEventListener("click", () => this.undoStroke(), { signal });
-    this.root.querySelector(".finish-drawing").addEventListener("click", () => this.finishDrawing(), { signal });
-    this.reviewButton.addEventListener("click", () => this.makePreview(), { signal });
-    this.root.querySelector(".back").addEventListener("click", () => this.leaveReview(), { signal });
-    this.sendButton.addEventListener("click", () => this.send(), { signal });
-    this.overall.addEventListener("input", () => this.invalidatePreview(), { signal });
+    this.launcher.addEventListener("click", () => this.toggleDock(), { signal });
+    this.root.querySelector(".select-mode").addEventListener("click", () => this.setMode("select"), { signal });
+    this.root.querySelector(".sticky-mode").addEventListener("click", () => this.setMode("sticky"), { signal });
+    this.root.querySelector(".draw-mode").addEventListener("click", () => this.setMode("draw"), { signal });
+    this.root.querySelector(".region-mode").addEventListener("click", () => this.setMode("region"), { signal });
+    this.root.querySelector(".undo").addEventListener("click", () => this.undo(), { signal });
+    this.root.querySelector(".redo").addEventListener("click", () => this.redo(), { signal });
+    this.root.querySelector(".delete-selection").addEventListener("click", () => this.deleteSelectedStrokes(), { signal });
+    this.root.querySelector(".review").addEventListener("click", () => this.makePreview(), { signal });
+    this.root.querySelector(".close-review").addEventListener("click", () => this.closePreview(), { signal });
+    this.root.querySelector(".send").addEventListener("click", () => this.send(), { signal });
+
+    this.general.addEventListener("focus", () => this.beginGeneralEdit(), { signal });
+    this.general.addEventListener("input", () => this.onGeneralInput(), { signal });
+    this.general.addEventListener("blur", () => this.finishGeneralEdit(), { signal });
 
     document.addEventListener("pointerdown", (event) => this.onPointerDown(event), { capture: true, signal });
     document.addEventListener("pointermove", (event) => this.onPointerMove(event), { capture: true, signal });
@@ -282,226 +372,220 @@ class AgentNudgeWidget extends HTMLElement {
     document.addEventListener("pointercancel", (event) => this.onPointerUp(event), { capture: true, signal });
     document.addEventListener("click", (event) => this.onDocumentClick(event), { capture: true, signal });
     document.addEventListener("keydown", (event) => this.onKeyDown(event), { capture: true, signal });
-    window.addEventListener("resize", () => this.refreshElementRects(), { signal });
-    window.addEventListener("scroll", () => this.refreshElementRects(), { signal, passive: true });
+    window.addEventListener("resize", () => this.onViewportChange(), { signal });
+    window.addEventListener("scroll", () => this.onViewportChange(), { signal, passive: true });
+    this.render();
   }
 
   disconnectedCallback() {
     this.abort.abort();
   }
 
-  open() {
-    this.launcher.hidden = true;
-    this.panel.hidden = false;
-    queueMicrotask(() => this.overall.focus());
+  toggleDock() {
+    this.opened = !this.opened;
+    this.mode = this.opened ? "select" : "idle";
+    this.cancelTransientEditors();
+    this.closePreview();
+    this.render();
   }
 
-  close() {
-    this.cancelActiveMode();
-    this.panel.hidden = true;
-    this.launcher.hidden = false;
-  }
-
-  toggleCommentMode() {
-    if (this.draftPosition) {
-      this.setStatus("Save or cancel the open sticky note first.", true);
-      this.focusDraft();
+  setMode(mode) {
+    if (this.sent) return;
+    if (this.draft || this.editingCommentId) {
+      this.setStatus("Finish the open sticky note first.");
+      this.focusStickyEditor();
       return;
     }
-    if (this.mode === "comment") {
-      this.cancelActiveMode();
-      this.setStatus("Comments mode finished. Review the page or keep drawing.");
-      return;
-    }
-    this.invalidatePreview();
-    this.mode = "comment";
+    this.mode = mode;
+    this.hoverRect = null;
+    this.pendingRect = null;
     this.dragStart = null;
     this.pointerTarget = null;
-    this.hoverRect = null;
-    this.setStatus("Comments mode: click anything, click near a drawing, or drag around an area.");
-    this.render();
-  }
-
-  beginDrawMode() {
-    if (this.draftPosition) {
-      this.setStatus("Save or cancel the open sticky note first.", true);
-      this.focusDraft();
-      return;
-    }
+    if (!["select", "region"].includes(mode)) this.selectedStrokeIds.clear();
+    this.closePreview();
     this.invalidatePreview();
-    this.mode = "draw";
-    this.currentStroke = null;
-    this.panel.hidden = true;
-    this.drawToolbar.hidden = false;
-    this.setStatus("");
     this.render();
   }
 
-  finishDrawing() {
-    this.mode = "idle";
-    this.currentStroke = null;
-    this.drawToolbar.hidden = true;
-    this.panel.hidden = false;
-    this.setStatus(this.strokes.length ? "Drawing added. Add more feedback or review the batch." : "");
-    this.render();
+  beginGeneralEdit() {
+    this.generalBeforeEdit = this.snapshot();
+    this.autoSizeGeneral();
   }
 
-  undoStroke() {
-    if (this.strokes.length) {
-      this.strokes.pop();
-      this.invalidatePreview();
-      this.render();
-    }
-  }
-
-  cancelActiveMode() {
-    if (this.mode === "draw") {
-      this.drawToolbar.hidden = true;
-      this.panel.hidden = false;
-    }
-    this.mode = "idle";
-    this.dragStart = null;
-    this.pointerTarget = null;
-    this.currentStroke = null;
-    this.hoverRect = null;
-    this.setStatus("");
-    this.render();
-  }
-
-  cancelCommentDraft() {
-    this.draftSelection = null;
-    this.draftElement = null;
-    this.draftPosition = null;
-    this.draftMessage = "";
+  onGeneralInput() {
+    this.autoSizeGeneral();
     this.invalidatePreview();
-    this.setStatus("");
-    this.render();
   }
 
-  clearAll() {
-    this.cancelActiveMode();
-    this.comments = [];
-    this.strokes = [];
-    this.commentCounter = 0;
-    this.draftSelection = null;
-    this.draftElement = null;
-    this.draftPosition = null;
-    this.draftMessage = "";
-    this.overall.value = "";
-    this.invalidatePreview();
-    this.setStatus("All feedback cleared.");
-    this.render();
+  finishGeneralEdit() {
+    if (this.generalBeforeEdit && this.generalBeforeEdit.message !== this.general.value) {
+      this.pushUndoSnapshot(this.generalBeforeEdit);
+    }
+    this.generalBeforeEdit = null;
+    this.autoSizeGeneral();
+    this.renderHistoryButtons();
+  }
+
+  autoSizeGeneral() {
+    if (this.root.activeElement === this.general) {
+      this.general.style.height = "26px";
+      this.general.style.height = `${Math.min(96, Math.max(52, this.general.scrollHeight))}px`;
+    } else {
+      this.general.style.height = "26px";
+    }
   }
 
   onPointerDown(event) {
-    if (this.mode === "idle" || event.composedPath().includes(this)) return;
+    if (!this.opened || this.mode === "idle" || event.composedPath().includes(this)) return;
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    const point = { x: event.clientX, y: event.clientY };
+
+    if (this.draft || this.editingCommentId) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      this.focusStickyEditor();
+      return;
+    }
 
     event.preventDefault();
     event.stopImmediatePropagation();
     this.suppressNextClick = true;
 
-    if (this.mode === "comment") {
-      if (this.draftPosition) {
-        this.setStatus("Save or cancel the open sticky note first.", true);
-        this.focusDraft();
-        return;
+    if (this.mode === "select") {
+      const stroke = this.hitStroke(point);
+      if (stroke) {
+        if (!event.shiftKey) this.selectedStrokeIds.clear();
+        if (this.selectedStrokeIds.has(stroke.id) && event.shiftKey) this.selectedStrokeIds.delete(stroke.id);
+        else this.selectedStrokeIds.add(stroke.id);
+      } else {
+        this.selectedStrokeIds.clear();
       }
-      this.dragStart = { x: event.clientX, y: event.clientY };
-      this.pointerTarget = target;
-      this.draftSelection = null;
-      const meaningful = meaningfulTarget(target);
-      this.hoverRect = meaningful ? plainRect(meaningful.getBoundingClientRect()) : null;
-      this.renderOverlay();
+      this.render();
       return;
     }
 
     if (this.mode === "draw") {
+      this.pushUndo();
+      this.strokeCounter += 1;
       this.currentStroke = {
-        points: [{ x: event.clientX, y: event.clientY }],
+        id: `stroke-${this.strokeCounter}`,
+        points: [point],
         color: INK_COLOR,
         width: INK_WIDTH,
       };
       this.strokes.push(this.currentStroke);
+      this.renderDrawingLayer();
+      return;
+    }
+
+    if (this.mode === "sticky" || this.mode === "region") {
+      this.dragStart = point;
+      this.pointerTarget = target;
+      this.pendingRect = null;
+      if (this.mode === "sticky") {
+        const meaningful = meaningfulTarget(target);
+        this.hoverRect = meaningful ? plainRect(meaningful.getBoundingClientRect()) : null;
+      }
       this.renderOverlay();
     }
   }
 
   onPointerMove(event) {
-    if (this.mode === "comment") {
-      if (this.dragStart) {
-        event.preventDefault();
-        const distance = Math.hypot(event.clientX - this.dragStart.x, event.clientY - this.dragStart.y);
-        if (distance >= 6) {
-          this.hoverRect = null;
-          this.draftSelection = {
-            kind: "region",
-            rect: rectFromPoints(this.dragStart, { x: event.clientX, y: event.clientY }),
-            element: null,
-          };
-        }
-        this.renderOverlay();
-      } else {
-        const target = event.target instanceof Element ? event.target : null;
-        if (target && !event.composedPath().includes(this)) {
-          const meaningful = meaningfulTarget(target);
-          this.hoverRect = meaningful ? plainRect(meaningful.getBoundingClientRect()) : null;
-          this.renderOverlay();
-        }
+    const point = { x: event.clientX, y: event.clientY };
+    if (this.mode === "draw" && this.currentStroke) {
+      event.preventDefault();
+      const last = this.currentStroke.points.at(-1);
+      if (!last || pointDistance(point, last) >= 1.5) {
+        this.currentStroke.points.push(point);
+        this.renderDrawingLayer();
       }
       return;
     }
 
-    if (this.mode === "draw" && this.currentStroke) {
+    if ((this.mode === "sticky" || this.mode === "region") && this.dragStart) {
       event.preventDefault();
-      const point = { x: event.clientX, y: event.clientY };
-      const last = this.currentStroke.points.at(-1);
-      if (!last || Math.hypot(point.x - last.x, point.y - last.y) >= 1.5) {
-        this.currentStroke.points.push(point);
-        this.renderDrawingLayer();
+      const distance = pointDistance(point, this.dragStart);
+      if (distance >= 6) {
+        this.hoverRect = null;
+        this.pendingRect = rectFromPoints(this.dragStart, point);
       }
+      this.renderOverlay();
+      return;
+    }
+
+    if (this.mode === "sticky" && !this.dragStart) {
+      const target = event.target instanceof Element ? meaningfulTarget(event.target) : null;
+      this.hoverRect = target ? plainRect(target.getBoundingClientRect()) : null;
+      this.renderOverlay();
     }
   }
 
   onPointerUp(event) {
-    if (this.mode === "comment" && this.dragStart) {
-      event.preventDefault();
-      event.stopImmediatePropagation();
-      const distance = Math.hypot(event.clientX - this.dragStart.x, event.clientY - this.dragStart.y);
-      const position = { x: event.clientX, y: event.clientY };
-      if (distance >= 8 && this.draftSelection) {
-        this.draftElement = null;
-      } else {
-        const target = nearDrawing(position, this.strokes) ? null : meaningfulTarget(this.pointerTarget);
-        this.draftElement = target;
-        this.draftSelection = target ? {
-          kind: "element",
-          rect: plainRect(target.getBoundingClientRect()),
-          element: describeElement(target),
-        } : null;
-      }
-      this.draftPosition = position;
-      this.draftMessage = "";
-      this.dragStart = null;
-      this.pointerTarget = null;
-      this.hoverRect = null;
-      this.setStatus(`Sticky placed ${this.draftSelection ? `beside ${selectionLabel(this.draftSelection)}` : "on the page"}.`);
-      this.render();
-      this.focusDraft();
-      return;
-    }
-
+    const point = { x: event.clientX, y: event.clientY };
     if (this.mode === "draw" && this.currentStroke) {
       event.preventDefault();
       event.stopImmediatePropagation();
       if (this.currentStroke.points.length === 1) {
-        const point = this.currentStroke.points[0];
-        this.currentStroke.points.push({ x: point.x + 0.01, y: point.y + 0.01 });
+        const first = this.currentStroke.points[0];
+        this.currentStroke.points.push({ x: first.x + 0.01, y: first.y + 0.01 });
       }
       this.currentStroke = null;
       this.invalidatePreview();
       this.render();
+      return;
+    }
+
+    if (this.mode === "region" && this.dragStart) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const rect = this.pendingRect;
+      this.selectedStrokeIds.clear();
+      if (rect && rect.width >= 6 && rect.height >= 6) {
+        for (const stroke of this.strokes) {
+          if (strokeIntersectsRect(stroke, rect)) this.selectedStrokeIds.add(stroke.id);
+        }
+      }
+      this.dragStart = null;
+      this.pointerTarget = null;
+      this.pendingRect = null;
+      this.render();
+      return;
+    }
+
+    if (this.mode === "sticky" && this.dragStart) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      const distance = pointDistance(point, this.dragStart);
+      let selection = null;
+      let element = null;
+      if (distance >= 8 && this.pendingRect) {
+        selection = { kind: "region", rect: { ...this.pendingRect }, element: null };
+      } else if (!nearDrawing(point, this.strokes)) {
+        element = meaningfulTarget(this.pointerTarget);
+        if (element) {
+          selection = {
+            kind: "element",
+            rect: plainRect(element.getBoundingClientRect()),
+            element: describeElement(element),
+          };
+        }
+      }
+      const cardPosition = placeSticky(point, selection?.rect || null);
+      this.draft = {
+        position: point,
+        cardPosition,
+        selection,
+        element,
+        message: "",
+        error: false,
+      };
+      this.dragStart = null;
+      this.pointerTarget = null;
+      this.hoverRect = null;
+      this.pendingRect = null;
+      this.render();
+      this.focusStickyEditor();
     }
   }
 
@@ -513,56 +597,213 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   onKeyDown(event) {
-    if (event.key !== "Escape" || this.mode === "idle") return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    if (this.mode === "draw") this.finishDrawing();
-    else this.cancelActiveMode();
-  }
+    const path = event.composedPath();
+    const isTyping = path.some((node) => node instanceof HTMLTextAreaElement || node instanceof HTMLInputElement);
 
-  saveComment(messageValue) {
-    if (!this.draftPosition) return;
-    const message = messageValue.trim();
-    if (!message) {
-      this.setStatus("Write something on the sticky note first.", true);
-      this.focusDraft();
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "z" && !isTyping) {
+      event.preventDefault();
+      if (event.shiftKey) this.redo();
+      else this.undo();
       return;
     }
+    if ((event.key === "Delete" || event.key === "Backspace") && !isTyping && this.selectedStrokeIds.size) {
+      event.preventDefault();
+      this.deleteSelectedStrokes();
+      return;
+    }
+    if (event.key !== "Escape") return;
+    if (this.draft) {
+      event.preventDefault();
+      this.cancelDraft();
+    } else if (this.editingCommentId) {
+      event.preventDefault();
+      this.cancelEditComment();
+    } else if (this.opened) {
+      event.preventDefault();
+      this.setMode("select");
+    }
+  }
+
+  saveDraft(messageValue) {
+    if (!this.draft) return;
+    const message = messageValue.trim();
+    if (!message) {
+      this.draft.error = true;
+      this.renderStickyLayer();
+      this.focusStickyEditor();
+      return;
+    }
+    this.pushUndo();
     this.commentCounter += 1;
     this.comments.push({
       id: `comment-${this.commentCounter}`,
       message,
-      position: { ...this.draftPosition },
-      selection: this.draftSelection ? structuredClone(this.draftSelection) : null,
-      element: this.draftElement,
+      position: { ...this.draft.position },
+      cardPosition: { ...this.draft.cardPosition },
+      selection: this.draft.selection ? structuredClone(this.draft.selection) : null,
+      element: this.draft.element,
     });
-    this.draftSelection = null;
-    this.draftElement = null;
-    this.draftPosition = null;
-    this.draftMessage = "";
+    this.draft = null;
     this.invalidatePreview();
-    this.setStatus("Sticky saved. Comments mode is still on—click or drag to add another.");
     this.render();
+  }
+
+  cancelDraft() {
+    this.draft = null;
+    this.hoverRect = null;
+    this.pendingRect = null;
+    this.render();
+  }
+
+  startEditComment(comment) {
+    if (this.draft) return;
+    this.editingCommentId = comment.id;
+    this.editingMessage = comment.message;
+    this.renderStickyLayer();
+    this.focusStickyEditor();
+  }
+
+  saveEditComment(id, messageValue) {
+    const comment = this.comments.find((value) => value.id === id);
+    const message = messageValue.trim();
+    if (!comment || !message) {
+      this.setStatus("A sticky note cannot be empty.");
+      this.focusStickyEditor();
+      return;
+    }
+    if (message !== comment.message) {
+      this.pushUndo();
+      comment.message = message;
+      this.invalidatePreview();
+    }
+    this.editingCommentId = null;
+    this.editingMessage = "";
+    this.render();
+  }
+
+  cancelEditComment() {
+    this.editingCommentId = null;
+    this.editingMessage = "";
+    this.renderStickyLayer();
   }
 
   removeComment(id) {
+    if (!this.comments.some((comment) => comment.id === id)) return;
+    this.pushUndo();
     this.comments = this.comments.filter((comment) => comment.id !== id);
+    if (this.editingCommentId === id) this.editingCommentId = null;
     this.invalidatePreview();
-    this.setStatus("Sticky removed.");
     this.render();
   }
 
-  focusDraft() {
-    queueMicrotask(() => this.stickyLayer.querySelector(".sticky-card[data-draft] textarea")?.focus());
+  beginStickyDrag(event, comment, card) {
+    if (event.target.closest("button")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pointerId = event.pointerId;
+    const start = { x: event.clientX, y: event.clientY };
+    const origin = { ...comment.cardPosition };
+    const before = this.snapshot();
+    let moved = false;
+    card.setPointerCapture(pointerId);
+
+    const move = (moveEvent) => {
+      const dx = moveEvent.clientX - start.x;
+      const dy = moveEvent.clientY - start.y;
+      if (Math.hypot(dx, dy) > 2) moved = true;
+      const position = clampCardPosition({ x: origin.x + dx, y: origin.y + dy });
+      comment.cardPosition = position;
+      card.style.left = `${position.x}px`;
+      card.style.top = `${position.y}px`;
+      this.invalidatePreview();
+    };
+    const up = () => {
+      card.removeEventListener("pointermove", move);
+      card.removeEventListener("pointerup", up);
+      card.removeEventListener("pointercancel", up);
+      if (moved) this.pushUndoSnapshot(before);
+      this.renderHistoryButtons();
+    };
+    card.addEventListener("pointermove", move);
+    card.addEventListener("pointerup", up);
+    card.addEventListener("pointercancel", up);
   }
 
-  refreshElementRects() {
-    for (const comment of this.comments) this.currentCommentRect(comment);
-    if (this.draftSelection && this.draftElement?.isConnected) {
-      this.draftSelection.rect = plainRect(this.draftElement.getBoundingClientRect());
-    }
+  deleteSelectedStrokes() {
+    if (!this.selectedStrokeIds.size) return;
+    this.pushUndo();
+    this.strokes = this.strokes.filter((stroke) => !this.selectedStrokeIds.has(stroke.id));
+    this.selectedStrokeIds.clear();
     this.invalidatePreview();
     this.render();
+  }
+
+  hitStroke(point) {
+    return [...this.strokes].reverse().find((stroke) => strokeHitDistance(point, stroke) <= Math.max(8, stroke.width + 5)) || null;
+  }
+
+  snapshot() {
+    return {
+      message: this.general?.value || "",
+      comments: this.comments.map((comment) => ({
+        id: comment.id,
+        message: comment.message,
+        position: { ...comment.position },
+        cardPosition: { ...comment.cardPosition },
+        selection: comment.selection ? structuredClone(comment.selection) : null,
+      })),
+      strokes: structuredClone(this.strokes),
+    };
+  }
+
+  pushUndo() {
+    this.pushUndoSnapshot(this.snapshot());
+  }
+
+  pushUndoSnapshot(snapshot) {
+    this.undoStack.push(snapshot);
+    if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
+    this.redoStack = [];
+    this.renderHistoryButtons();
+  }
+
+  undo() {
+    const previous = this.undoStack.pop();
+    if (!previous) return;
+    this.redoStack.push(this.snapshot());
+    this.restore(previous);
+  }
+
+  redo() {
+    const next = this.redoStack.pop();
+    if (!next) return;
+    this.undoStack.push(this.snapshot());
+    this.restore(next);
+  }
+
+  restore(snapshot) {
+    this.general.value = snapshot.message;
+    this.comments = snapshot.comments.map((comment) => ({
+      ...structuredClone(comment),
+      element: resolveCommentElement(comment),
+    }));
+    this.strokes = structuredClone(snapshot.strokes);
+    this.selectedStrokeIds.clear();
+    this.cancelTransientEditors();
+    this.invalidatePreview();
+    this.autoSizeGeneral();
+    this.render();
+  }
+
+  cancelTransientEditors() {
+    this.draft = null;
+    this.editingCommentId = null;
+    this.editingMessage = "";
+    this.dragStart = null;
+    this.pointerTarget = null;
+    this.hoverRect = null;
+    this.pendingRect = null;
+    this.currentStroke = null;
   }
 
   currentCommentRect(comment) {
@@ -573,43 +814,51 @@ class AgentNudgeWidget extends HTMLElement {
     return comment.selection.rect;
   }
 
-  invalidatePreview() {
-    this.preview = null;
-    this.review.hidden = true;
-    this.root.querySelector(".compose-actions").hidden = false;
+  onViewportChange() {
+    for (const comment of this.comments) this.currentCommentRect(comment);
+    if (this.draft?.element?.isConnected) {
+      this.draft.selection.rect = plainRect(this.draft.element.getBoundingClientRect());
+    }
+    this.invalidatePreview();
+    this.renderOverlay();
   }
 
-  leaveReview() {
-    this.review.hidden = true;
-    this.root.querySelector(".compose-actions").hidden = false;
+  invalidatePreview() {
+    this.preview = null;
+    this.reviewPopover.hidden = true;
+  }
+
+  closePreview() {
+    this.reviewPopover.hidden = true;
   }
 
   async makePreview() {
-    if (this.draftPosition) {
-      this.setStatus("Save or cancel the open sticky note first.", true);
-      this.focusDraft();
+    if (this.sent) return;
+    if (this.draft || this.editingCommentId) {
+      this.setStatus("Finish the open sticky note first.");
+      this.focusStickyEditor();
       return;
     }
-    if (!this.overall.value.trim() && this.comments.length === 0 && this.strokes.length === 0) {
-      this.setStatus("Add a comment, draw on the page, or write an overall note first.", true);
+    if (!this.general.value.trim() && this.comments.length === 0 && this.strokes.length === 0) {
+      this.setStatus("Add feedback before reviewing.");
+      if (!window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+        this.dock.animate([{ transform: "translateX(0)" }, { transform: "translateX(-4px)" }, { transform: "translateX(0)" }], { duration: 180 });
+      }
       return;
     }
-
-    this.cancelActiveMode();
-    this.reviewButton.disabled = true;
-    this.setStatus("Capturing the annotated page…");
+    const button = this.root.querySelector(".review");
+    button.disabled = true;
     try {
       const screenshotDataUrl = await this.captureScreenshot();
       this.preview = this.buildPayload(screenshotDataUrl);
       this.previewImage.src = screenshotDataUrl;
-      this.root.querySelector(".compose-actions").hidden = true;
-      this.review.hidden = false;
-      this.setStatus("Review exactly what the agent will receive.");
+      this.reviewPopover.hidden = false;
+      this.setStatus("Feedback preview ready.");
     } catch (error) {
       console.error("AgentNudge screenshot failed", error);
-      this.setStatus("Could not capture this page. Cross-origin media may be blocking the screenshot.", true);
+      this.setStatus("The page could not be captured.");
     } finally {
-      this.reviewButton.disabled = false;
+      button.disabled = false;
     }
   }
 
@@ -652,13 +901,7 @@ class AgentNudgeWidget extends HTMLElement {
     context.scale(scaleX, scaleY);
     this.strokes.forEach((stroke) => drawStroke(context, stroke));
     this.comments.forEach((comment, index) => {
-      drawSticky(
-        context,
-        comment,
-        this.currentCommentRect(comment),
-        this.stickyPositionFor(comment),
-        index + 1,
-      );
+      drawSticky(context, comment, this.currentCommentRect(comment), comment.cardPosition, index + 1);
     });
     context.restore();
     return canvas.toDataURL("image/png");
@@ -667,7 +910,7 @@ class AgentNudgeWidget extends HTMLElement {
   buildPayload(screenshotDataUrl) {
     return {
       sessionId: SESSION_ID,
-      message: this.overall.value.trim(),
+      message: this.general.value.trim(),
       page: {
         url: `${location.origin}${location.pathname}`,
         title: document.title,
@@ -683,6 +926,7 @@ class AgentNudgeWidget extends HTMLElement {
         id: comment.id,
         message: comment.message,
         position: { ...comment.position },
+        cardPosition: { ...comment.cardPosition },
         selection: comment.selection ? {
           kind: comment.selection.kind,
           rect: { ...this.currentCommentRect(comment) },
@@ -695,9 +939,9 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   async send() {
-    if (!this.preview) return;
-    this.sendButton.disabled = true;
-    this.setStatus("Sending the full batch to the waiting agent…");
+    if (!this.preview || this.sent) return;
+    const button = this.root.querySelector(".send");
+    button.disabled = true;
     try {
       const response = await fetch(`${ENDPOINT}/submit`, {
         method: "POST",
@@ -711,44 +955,57 @@ class AgentNudgeWidget extends HTMLElement {
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
-      this.setStatus("Sent. The waiting agent has every comment and drawing.");
-      this.overall.disabled = true;
-      this.root.querySelectorAll("button:not(.close)").forEach((button) => { button.disabled = true; });
+      this.sent = true;
+      this.reviewPopover.hidden = true;
+      this.setStatus("Feedback sent.");
+      this.render();
     } catch (error) {
       console.error("AgentNudge submission failed", error);
-      this.setStatus(`Could not send feedback: ${error.message}`, true);
-      this.sendButton.disabled = false;
+      this.setStatus("Feedback could not be sent.");
+      button.disabled = false;
     }
   }
 
-  setStatus(message, error = false) {
+  focusStickyEditor() {
+    queueMicrotask(() => this.stickyLayer.querySelector("textarea")?.focus());
+  }
+
+  setStatus(message) {
     this.status.textContent = message;
-    this.status.dataset.error = String(error);
+    this.dock.title = message;
   }
 
   render() {
-    this.root.querySelector(".comment-mode").dataset.active = String(this.mode === "comment");
-    this.root.querySelector(".draw-mode").dataset.active = String(this.mode === "draw");
-
-    const parts = [];
-    if (this.comments.length) parts.push(`${this.comments.length} ${this.comments.length === 1 ? "comment" : "comments"}`);
-    if (this.strokes.length) parts.push(`${this.strokes.length} drawing ${this.strokes.length === 1 ? "stroke" : "strokes"}`);
-    this.annotationSummary.hidden = parts.length === 0;
-    this.annotationSummary.textContent = parts.length ? `${parts.join(" · ")} ready to send together.` : "";
-
+    this.dock.dataset.open = String(this.opened);
+    this.launcher.setAttribute("aria-expanded", String(this.opened));
+    this.launcher.setAttribute("aria-label", this.opened ? "Close annotation toolbar" : "Open annotation toolbar");
+    this.launcher.title = this.opened ? "Close annotation toolbar" : "Open annotation toolbar";
+    for (const mode of ["select", "sticky", "draw", "region"]) {
+      const button = this.root.querySelector(`.${mode}-mode`);
+      button.dataset.active = String(this.mode === mode);
+      button.setAttribute("aria-pressed", String(this.mode === mode));
+    }
+    this.root.querySelectorAll(".toolbar .icon-button").forEach((button) => {
+      if (!button.matches(".undo, .redo, .delete-selection")) button.disabled = this.sent;
+    });
+    this.general.disabled = this.sent;
+    this.renderHistoryButtons();
     this.renderOverlay();
+  }
+
+  renderHistoryButtons() {
+    this.root.querySelector(".undo").disabled = this.sent || this.undoStack.length === 0;
+    this.root.querySelector(".redo").disabled = this.sent || this.redoStack.length === 0;
+    this.root.querySelector(".delete-selection").disabled = this.sent || this.selectedStrokeIds.size === 0;
   }
 
   renderOverlay() {
     setRect(this.hoverBox, this.hoverRect, Boolean(this.hoverRect));
-    setRect(this.pendingBox, this.draftSelection?.rect, Boolean(this.draftSelection));
+    setRect(this.pendingBox, this.pendingRect, Boolean(this.pendingRect));
     this.renderAnnotationLayer();
     this.renderDrawingLayer();
     this.renderStickyLayer();
-
-    const label = this.mode === "comment" ? "Comments mode · click anywhere or drag an area · Esc to finish" : null;
-    this.modePill.hidden = !label || this.mode === "draw";
-    this.modePill.textContent = label || "";
+    this.renderHistoryButtons();
   }
 
   renderAnnotationLayer() {
@@ -775,77 +1032,181 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   renderDrawingLayer() {
-    this.drawingLayer.replaceChildren(...this.strokes.map((stroke) => {
-      return svgElement("path", {
+    const nodes = [];
+    for (const stroke of this.strokes) {
+      if (this.selectedStrokeIds.has(stroke.id)) {
+        nodes.push(svgElement("path", {
+          class: "drawing-selection",
+          d: strokePath(stroke.points),
+          "stroke-width": stroke.width + 7,
+        }));
+      }
+      nodes.push(svgElement("path", {
         class: "drawing-stroke",
         d: strokePath(stroke.points),
         stroke: stroke.color,
         "stroke-width": stroke.width,
-      });
-    }));
+      }));
+    }
+    this.drawingLayer.replaceChildren(...nodes);
   }
 
   renderStickyLayer() {
-    const cards = this.comments.map((comment, index) => {
-      const card = stickyCard({
-        number: index + 1,
-        message: comment.message,
-        target: selectionLabel(comment.selection),
-        position: this.stickyPositionFor(comment),
-      });
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "remove-sticky";
-      remove.textContent = "Remove";
-      remove.setAttribute("aria-label", `Remove sticky ${index + 1}`);
-      remove.addEventListener("click", () => this.removeComment(comment.id));
-      card.querySelector(".sticky-head").append(remove);
-      return card;
-    });
-
-    if (this.draftPosition) {
-      const draft = stickyCard({
-        number: this.comments.length + 1,
-        message: null,
-        target: selectionLabel(this.draftSelection),
-        position: this.stickyPositionFor({
-          position: this.draftPosition,
-          selection: this.draftSelection,
-          element: this.draftElement,
-        }),
-        draft: true,
-      });
-      const textarea = document.createElement("textarea");
-      textarea.maxLength = 5000;
-      textarea.placeholder = "Leave a comment…";
-      textarea.setAttribute("aria-label", "Sticky note comment");
-      textarea.value = this.draftMessage;
-      textarea.addEventListener("input", () => {
-        this.draftMessage = textarea.value;
-        this.invalidatePreview();
-      });
-      const actions = document.createElement("div");
-      actions.className = "actions";
-      const cancel = document.createElement("button");
-      cancel.type = "button";
-      cancel.className = "secondary";
-      cancel.textContent = "Cancel";
-      cancel.addEventListener("click", () => this.cancelCommentDraft());
-      const save = document.createElement("button");
-      save.type = "button";
-      save.className = "primary";
-      save.textContent = "Comment";
-      save.addEventListener("click", () => this.saveComment(textarea.value));
-      actions.append(cancel, save);
-      draft.append(textarea, actions);
-      cards.push(draft);
-    }
+    const cards = this.comments.map((comment, index) => this.savedStickyCard(comment, index + 1));
+    if (this.draft) cards.push(this.draftStickyCard());
     this.stickyLayer.replaceChildren(...cards);
   }
 
-  stickyPositionFor(comment) {
-    const rect = comment.selection ? this.currentCommentRect(comment) : null;
-    return placeSticky(comment.position, rect);
+  savedStickyCard(comment, number) {
+    const editing = this.editingCommentId === comment.id;
+    const card = baseStickyCard(number, selectionLabel(comment.selection), comment.cardPosition);
+    const head = card.querySelector(".sticky-head");
+    const grip = document.createElement("span");
+    grip.className = "sticky-icon";
+    grip.setAttribute("aria-hidden", "true");
+    grip.innerHTML = iconDots;
+    head.append(grip);
+
+    if (!editing) {
+      const edit = createIconButton("Edit sticky", iconEdit, "sticky-icon");
+      edit.addEventListener("pointerdown", (event) => event.stopPropagation());
+      edit.addEventListener("click", () => this.startEditComment(comment));
+      const remove = createIconButton("Delete sticky", iconTrash, "sticky-icon");
+      remove.addEventListener("pointerdown", (event) => event.stopPropagation());
+      remove.addEventListener("click", () => this.removeComment(comment.id));
+      head.append(edit, remove);
+      const copy = document.createElement("div");
+      copy.className = "sticky-message";
+      copy.textContent = comment.message;
+      card.append(copy);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.maxLength = 5000;
+      textarea.value = this.editingMessage;
+      textarea.setAttribute("aria-label", "Edit sticky note");
+      textarea.addEventListener("input", () => { this.editingMessage = textarea.value; });
+      textarea.addEventListener("keydown", (event) => {
+        if ((event.metaKey || event.ctrlKey) && event.key === "Enter") this.saveEditComment(comment.id, textarea.value);
+      });
+      const actions = document.createElement("div");
+      actions.className = "sticky-actions";
+      const cancel = createIconButton("Cancel editing", iconX, "sticky-icon");
+      cancel.addEventListener("click", () => this.cancelEditComment());
+      const save = createIconButton("Save sticky", iconCheck, "sticky-icon");
+      save.addEventListener("click", () => this.saveEditComment(comment.id, textarea.value));
+      actions.append(cancel, save);
+      card.append(textarea, actions);
+    }
+
+    head.addEventListener("pointerdown", (event) => this.beginStickyDrag(event, comment, card));
+    return card;
+  }
+
+  draftStickyCard() {
+    const card = baseStickyCard(this.comments.length + 1, selectionLabel(this.draft.selection), this.draft.cardPosition);
+    card.dataset.draft = "true";
+    card.dataset.error = String(Boolean(this.draft.error));
+    const head = card.querySelector(".sticky-head");
+    const grip = document.createElement("span");
+    grip.className = "sticky-icon";
+    grip.setAttribute("aria-hidden", "true");
+    grip.innerHTML = iconDots;
+    head.append(grip);
+    head.addEventListener("pointerdown", (event) => this.beginDraftDrag(event, card));
+    const textarea = document.createElement("textarea");
+    textarea.maxLength = 5000;
+    textarea.value = this.draft.message;
+    textarea.setAttribute("aria-label", "New sticky note");
+    textarea.addEventListener("input", () => {
+      this.draft.message = textarea.value;
+      this.draft.error = false;
+      card.dataset.error = "false";
+      this.invalidatePreview();
+    });
+    textarea.addEventListener("keydown", (event) => {
+      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") this.saveDraft(textarea.value);
+    });
+    const actions = document.createElement("div");
+    actions.className = "sticky-actions";
+    const cancel = createIconButton("Cancel sticky", iconX, "sticky-icon");
+    cancel.addEventListener("click", () => this.cancelDraft());
+    const save = createIconButton("Save sticky", iconCheck, "sticky-icon");
+    save.addEventListener("click", () => this.saveDraft(textarea.value));
+    actions.append(cancel, save);
+    card.append(textarea, actions);
+    return card;
+  }
+
+  beginDraftDrag(event, card) {
+    if (event.target.closest("button")) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pointerId = event.pointerId;
+    const start = { x: event.clientX, y: event.clientY };
+    const origin = { ...this.draft.cardPosition };
+    card.setPointerCapture(pointerId);
+
+    const move = (moveEvent) => {
+      const position = clampCardPosition({
+        x: origin.x + moveEvent.clientX - start.x,
+        y: origin.y + moveEvent.clientY - start.y,
+      });
+      this.draft.cardPosition = position;
+      card.style.left = `${position.x}px`;
+      card.style.top = `${position.y}px`;
+      this.invalidatePreview();
+    };
+    const up = () => {
+      card.removeEventListener("pointermove", move);
+      card.removeEventListener("pointerup", up);
+      card.removeEventListener("pointercancel", up);
+      this.focusStickyEditor();
+    };
+    card.addEventListener("pointermove", move);
+    card.addEventListener("pointerup", up);
+    card.addEventListener("pointercancel", up);
+  }
+}
+
+function iconButtonMarkup(className, label, svg, extraClass = "") {
+  return `<button class="icon-button ${className} ${extraClass}" type="button" aria-label="${label}" title="${label}">${svg}</button>`;
+}
+
+function createIconButton(label, svg, className = "icon-button") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = className;
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  button.innerHTML = svg;
+  return button;
+}
+
+function baseStickyCard(number, target, position) {
+  const card = document.createElement("section");
+  card.className = "sticky-card";
+  card.style.left = `${position.x}px`;
+  card.style.top = `${position.y}px`;
+  const head = document.createElement("div");
+  head.className = "sticky-head";
+  const badge = document.createElement("span");
+  badge.className = "sticky-number";
+  badge.textContent = String(number);
+  const targetLabel = document.createElement("span");
+  targetLabel.className = "sticky-target";
+  targetLabel.textContent = target;
+  head.append(badge, targetLabel);
+  card.append(head);
+  return card;
+}
+
+function resolveCommentElement(comment) {
+  const selector = comment.selection?.element?.selector;
+  if (!selector) return null;
+  try {
+    return document.querySelector(selector);
+  } catch {
+    return null;
   }
 }
 
@@ -874,7 +1235,7 @@ function meaningfulTarget(element) {
   );
   if (!target || target === document.body || target === document.documentElement) return null;
   const rect = target.getBoundingClientRect();
-  if (rect.width > window.innerWidth * 0.92 && rect.height > window.innerHeight * 0.75) return null;
+  if (rect.width > window.innerWidth * .92 && rect.height > window.innerHeight * .75) return null;
   return target;
 }
 
@@ -906,71 +1267,10 @@ function cssSelector(element) {
 }
 
 function selectionLabel(selection) {
-  if (!selection) return "Free sticky";
-  if (selection.kind === "region") {
-    return `${Math.round(selection.rect.width)} × ${Math.round(selection.rect.height)} area`;
-  }
+  if (!selection) return "";
+  if (selection.kind === "region") return `${Math.round(selection.rect.width)} × ${Math.round(selection.rect.height)}`;
   const element = selection.element;
-  return element?.accessibleName ? `${element.tag} “${element.accessibleName}”` : element?.tag || "element";
-}
-
-function stickyCard({ number, message, target, position, draft = false }) {
-  const card = document.createElement("section");
-  card.className = "sticky-card";
-  card.style.left = `${position.x}px`;
-  card.style.top = `${position.y}px`;
-  if (draft) card.dataset.draft = "true";
-  const head = document.createElement("div");
-  head.className = "sticky-head";
-  const badge = document.createElement("span");
-  badge.className = "sticky-number";
-  badge.textContent = String(number);
-  const targetLabel = document.createElement("span");
-  targetLabel.className = "sticky-target";
-  targetLabel.textContent = target;
-  head.append(badge, targetLabel);
-  card.append(head);
-  if (message !== null) {
-    const copy = document.createElement("div");
-    copy.className = "sticky-message";
-    copy.textContent = message;
-    card.append(copy);
-  }
-  return card;
-}
-
-function placeSticky(position, rect) {
-  const width = Math.min(230, window.innerWidth - 24);
-  const anchorX = rect ? rect.x + rect.width : position.x;
-  let x = anchorX + 14;
-  if (x + width > window.innerWidth - 12) {
-    x = (rect ? rect.x : position.x) - width - 14;
-  }
-  x = Math.max(12, Math.min(x, window.innerWidth - width - 12));
-  const anchorY = rect ? rect.y : position.y;
-  const y = Math.max(12, Math.min(anchorY, window.innerHeight - 150));
-  return { x, y };
-}
-
-function nearDrawing(point, strokes) {
-  return strokes.some((stroke) => {
-    if (stroke.points.length === 1) return pointDistance(point, stroke.points[0]) <= 12;
-    return stroke.points.slice(1).some((end, index) => {
-      return pointToSegmentDistance(point, stroke.points[index], end) <= Math.max(10, stroke.width + 6);
-    });
-  });
-}
-
-function pointDistance(first, second) {
-  return Math.hypot(first.x - second.x, first.y - second.y);
-}
-
-function pointToSegmentDistance(point, start, end) {
-  const dx = end.x - start.x;
-  const dy = end.y - start.y;
-  if (dx === 0 && dy === 0) return pointDistance(point, start);
-  const amount = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)));
-  return pointDistance(point, { x: start.x + amount * dx, y: start.y + amount * dy });
+  return element?.accessibleName ? `${element.tag} “${element.accessibleName}”` : element?.tag || "";
 }
 
 function escapeCss(value) {
@@ -1016,14 +1316,73 @@ function strokePath(points) {
   return points.map((point, index) => `${index === 0 ? "M" : "L"} ${point.x} ${point.y}`).join(" ");
 }
 
+function placeSticky(position, rect) {
+  const width = Math.min(230, window.innerWidth - 24);
+  const anchorX = rect ? rect.x + rect.width : position.x;
+  let x = anchorX + 14;
+  if (x + width > window.innerWidth - 12) x = (rect ? rect.x : position.x) - width - 14;
+  return clampCardPosition({ x, y: rect ? rect.y : position.y });
+}
+
+function clampCardPosition(position) {
+  const width = Math.min(230, window.innerWidth - 24);
+  return {
+    x: Math.max(12, Math.min(position.x, window.innerWidth - width - 12)),
+    y: Math.max(12, Math.min(position.y, window.innerHeight - 100)),
+  };
+}
+
+function nearDrawing(point, strokes) {
+  return strokes.some((stroke) => strokeHitDistance(point, stroke) <= Math.max(10, stroke.width + 6));
+}
+
+function strokeHitDistance(point, stroke) {
+  if (stroke.points.length === 1) return pointDistance(point, stroke.points[0]);
+  return Math.min(...stroke.points.slice(1).map((end, index) => pointToSegmentDistance(point, stroke.points[index], end)));
+}
+
+function strokeIntersectsRect(stroke, rect) {
+  if (stroke.points.some((point) => pointInsideRect(point, rect))) return true;
+  return stroke.points.slice(1).some((end, index) => segmentIntersectsRect(stroke.points[index], end, rect));
+}
+
+function pointInsideRect(point, rect) {
+  return point.x >= rect.x && point.x <= rect.x + rect.width && point.y >= rect.y && point.y <= rect.y + rect.height;
+}
+
+function segmentIntersectsRect(start, end, rect) {
+  const bounds = {
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    width: Math.abs(end.x - start.x),
+    height: Math.abs(end.y - start.y),
+  };
+  return bounds.x <= rect.x + rect.width
+    && bounds.x + bounds.width >= rect.x
+    && bounds.y <= rect.y + rect.height
+    && bounds.y + bounds.height >= rect.y;
+}
+
+function pointDistance(first, second) {
+  return Math.hypot(first.x - second.x, first.y - second.y);
+}
+
+function pointToSegmentDistance(point, start, end) {
+  const dx = end.x - start.x;
+  const dy = end.y - start.y;
+  if (dx === 0 && dy === 0) return pointDistance(point, start);
+  const amount = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)));
+  return pointDistance(point, { x: start.x + amount * dx, y: start.y + amount * dy });
+}
+
 function drawSticky(context, comment, rect, cardPosition, number) {
   const pinX = rect ? Math.max(13, rect.x + 4) : comment.position.x;
   const pinY = rect ? Math.max(13, rect.y + 4) : comment.position.y;
   context.save();
   if (rect) {
-    context.fillStyle = "rgba(239, 111, 67, .10)";
+    context.fillStyle = "rgb(220 88 53 / .09)";
     context.strokeStyle = INK_COLOR;
-    context.lineWidth = 2.5;
+    context.lineWidth = 2;
     context.fillRect(rect.x, rect.y, rect.width, rect.height);
     context.strokeRect(rect.x, rect.y, rect.width, rect.height);
   }
@@ -1031,14 +1390,14 @@ function drawSticky(context, comment, rect, cardPosition, number) {
   context.arc(pinX, pinY, 12, 0, Math.PI * 2);
   context.fillStyle = INK_COLOR;
   context.fill();
-  context.strokeStyle = "white";
+  context.strokeStyle = "#fffaf5";
   context.lineWidth = 2;
   context.stroke();
-  context.fillStyle = "white";
+  context.fillStyle = "#fffaf5";
   context.font = "800 11px ui-sans-serif, -apple-system, sans-serif";
   context.textAlign = "center";
   context.textBaseline = "middle";
-  context.fillText(String(number), pinX, pinY + 0.5);
+  context.fillText(String(number), pinX, pinY + .5);
 
   const cardWidth = Math.min(230, window.innerWidth - 24);
   const textWidth = cardWidth - 22;
@@ -1055,17 +1414,28 @@ function drawSticky(context, comment, rect, cardPosition, number) {
   context.arc(cardPosition.x + 22, cardPosition.y + 21, 11, 0, Math.PI * 2);
   context.fillStyle = INK_COLOR;
   context.fill();
-  context.fillStyle = "white";
+  context.fillStyle = "#fffaf5";
   context.font = "800 11px ui-sans-serif, -apple-system, sans-serif";
   context.fillText(String(number), cardPosition.x + 22, cardPosition.y + 21.5);
-  context.fillStyle = "#776a2a";
-  context.font = "10px ui-sans-serif, -apple-system, sans-serif";
-  context.textAlign = "left";
-  const target = selectionLabel(comment.selection);
-  context.fillText(target.slice(0, 30), cardPosition.x + 40, cardPosition.y + 21.5);
   context.fillStyle = "#292511";
   context.font = "12px ui-sans-serif, -apple-system, sans-serif";
+  context.textAlign = "left";
   lines.forEach((line, index) => context.fillText(line, cardPosition.x + 11, cardPosition.y + 42 + index * 17));
+  context.restore();
+}
+
+function drawStroke(context, stroke) {
+  if (!stroke.points.length) return;
+  context.save();
+  context.strokeStyle = stroke.color;
+  context.fillStyle = stroke.color;
+  context.lineWidth = stroke.width;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  context.beginPath();
+  context.moveTo(stroke.points[0].x, stroke.points[0].y);
+  for (const point of stroke.points.slice(1)) context.lineTo(point.x, point.y);
+  context.stroke();
   context.restore();
 }
 
@@ -1095,26 +1465,6 @@ function roundedRect(context, x, y, width, height, radius) {
   context.arcTo(x, y + height, x, y, radius);
   context.arcTo(x, y, x + width, y, radius);
   context.closePath();
-}
-
-function drawStroke(context, stroke) {
-  if (!stroke.points.length) return;
-  context.save();
-  context.strokeStyle = stroke.color;
-  context.fillStyle = stroke.color;
-  context.lineWidth = stroke.width;
-  context.lineCap = "round";
-  context.lineJoin = "round";
-  context.beginPath();
-  context.moveTo(stroke.points[0].x, stroke.points[0].y);
-  for (const point of stroke.points.slice(1)) context.lineTo(point.x, point.y);
-  context.stroke();
-  if (stroke.points.length === 1) {
-    context.beginPath();
-    context.arc(stroke.points[0].x, stroke.points[0].y, stroke.width / 2, 0, Math.PI * 2);
-    context.fill();
-  }
-  context.restore();
 }
 
 if (location.origin !== ALLOWED_ORIGIN) {

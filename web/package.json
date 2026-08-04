@@ -4,9 +4,10 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "build": "esbuild src/widget.js --bundle --format=iife --target=es2020 --minify --legal-comments=inline --outfile=dist/widget.js"
+    "build": "esbuild src/widget.js --bundle --format=iife --target=es2020 --loader:.svg=text --minify --legal-comments=inline --outfile=dist/widget.js"
   },
   "dependencies": {
+    "@tabler/icons": "^3.46.0",
     "html2canvas": "^1.4.1"
   },
   "devDependencies": {

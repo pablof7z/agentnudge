@@ -47,6 +47,7 @@ pub struct FeedbackComment {
     pub id: String,
     pub message: String,
     pub position: Point,
+    pub card_position: Point,
     pub selection: Option<Selection>,
 }
 
@@ -93,6 +94,7 @@ pub struct Point {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct DrawingStroke {
+    pub id: String,
     pub points: Vec<Point>,
     pub color: String,
     pub width: f64,
@@ -190,13 +192,19 @@ impl FeedbackSubmission {
                 ));
             }
             validate_point(&comment.position)?;
+            validate_point(&comment.card_position)?;
             if let Some(selection) = &mut comment.selection {
                 sanitize_selection(selection)?;
             }
         }
 
         let mut point_count = 0usize;
+        let mut drawing_ids = HashSet::new();
         for stroke in &mut self.drawings {
+            stroke.id = truncate(stroke.id.trim(), 100);
+            if stroke.id.is_empty() || !drawing_ids.insert(stroke.id.clone()) {
+                return Err("every drawing stroke needs a unique non-empty id".into());
+            }
             if stroke.points.is_empty() {
                 return Err("drawing strokes cannot be empty".into());
             }
@@ -387,9 +395,11 @@ mod tests {
                 id: "comment-1".into(),
                 message: "  Make this clearer  ".into(),
                 position: Point { x: 280.0, y: 72.0 },
+                card_position: Point { x: 294.0, y: 72.0 },
                 selection: Some(selection()),
             }],
             drawings: vec![DrawingStroke {
+                id: "stroke-1".into(),
                 points: vec![Point { x: 1.0, y: 2.0 }, Point { x: 3.0, y: 4.0 }],
                 color: "#DC5835".into(),
                 width: 4.0,
@@ -455,5 +465,21 @@ mod tests {
         let mut value = submission();
         value.comments.push(value.comments[0].clone());
         assert!(value.validate_and_sanitize("session").is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_drawing_ids() {
+        let mut value = submission();
+        value.drawings.push(value.drawings[0].clone());
+        let error = value.validate_and_sanitize("session").unwrap_err();
+        assert!(error.contains("drawing stroke"));
+    }
+
+    #[test]
+    fn rejects_an_invalid_sticky_card_position() {
+        let mut value = submission();
+        value.comments[0].card_position.x = f64::INFINITY;
+        let error = value.validate_and_sanitize("session").unwrap_err();
+        assert!(error.contains("invalid coordinate"));
     }
 }
