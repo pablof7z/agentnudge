@@ -898,7 +898,7 @@ export class AgentNudgeReview extends HTMLElement {
     this.setStatus("Capturing grouped feedback.");
     try {
       const screenshotDataUrl = await this.captureScreenshot();
-      const response = await fetch(`${ENDPOINT}/messages`, {
+      const response = await fetch(`${ENDPOINT}/feedback`, {
         method: "POST",
         mode: "cors",
         cache: "no-store",
@@ -912,9 +912,7 @@ export class AgentNudgeReview extends HTMLElement {
       if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
       this.resetReview();
       this.close();
-      document.dispatchEvent(new CustomEvent("agentnudge:open-chat", {
-        detail: { messageId: result.messageId, awaitingAgent: true },
-      }));
+      document.dispatchEvent(new CustomEvent("agentnudge:review-sent"));
     } catch (error) {
       console.error("AgentNudge grouped review failed", error);
       this.setStatus("Grouped feedback could not be sent.");

@@ -108,6 +108,7 @@ const css = String.raw`
   .launcher:hover { background: var(--raised); transform: translateY(-1px); }
   .launcher:active { transform: scale(.96); }
   .launcher svg { width: 21px; height: 21px; }
+  .launcher[data-sent="true"] { background: var(--accent); border-color: var(--accent); color: white; }
   .shell[data-open="true"] .launcher { opacity: 0; transform: translateX(16px) scale(.82); pointer-events: none; }
   .shell[data-review="true"] .launcher { opacity: 0; transform: translateX(16px) scale(.82); pointer-events: none; }
 
@@ -328,6 +329,8 @@ class AgentNudgeWidget extends HTMLElement {
     this.attachShadow({ mode: "open" });
     this.opened = false;
     this.reviewOpen = false;
+    this.reviewSent = false;
+    this.reviewSentTimer = null;
     this.mode = "idle";
     this.messages = [];
     this.cursor = 0;
@@ -406,6 +409,7 @@ class AgentNudgeWidget extends HTMLElement {
       </div>
     `;
     this.shell = this.shadowRoot.querySelector(".shell");
+    this.launcher = this.shadowRoot.querySelector(".launcher");
     this.sidebar = this.shadowRoot.querySelector(".sidebar");
     this.messagesNode = this.shadowRoot.querySelector(".messages");
     this.textarea = this.shadowRoot.querySelector("textarea");
@@ -425,7 +429,7 @@ class AgentNudgeWidget extends HTMLElement {
 
   connectedCallback() {
     const { signal } = this.abort;
-    this.shadowRoot.querySelector(".launcher").addEventListener("click", () => this.openReview(), { signal });
+    this.launcher.addEventListener("click", () => this.openReview(), { signal });
     this.shadowRoot.querySelector(".close").addEventListener("click", () => this.close(), { signal });
     this.shadowRoot.querySelector(".open-review").addEventListener("click", () => this.openReview(), { signal });
     this.endSessionButton.addEventListener("click", () => this.endSession(), { signal });
@@ -454,6 +458,18 @@ class AgentNudgeWidget extends HTMLElement {
       if (event.detail?.awaitingAgent) this.awaitingAgent = true;
       this.open();
     }, { signal });
+    document.addEventListener("agentnudge:review-sent", () => {
+      this.reviewOpen = false;
+      this.opened = false;
+      this.reviewSent = true;
+      if (this.reviewSentTimer) clearTimeout(this.reviewSentTimer);
+      this.reviewSentTimer = setTimeout(() => {
+        this.reviewSent = false;
+        this.reviewSentTimer = null;
+        this.renderShell();
+      }, 1800);
+      this.renderShell();
+    }, { signal });
     window.addEventListener("resize", () => this.renderOverlay(), { signal });
     window.addEventListener("scroll", () => this.renderOverlay(), { signal, passive: true });
     this.renderAll();
@@ -470,6 +486,7 @@ class AgentNudgeWidget extends HTMLElement {
     }
     this.replyImageCache.clear();
     if (this.endArmTimer) clearTimeout(this.endArmTimer);
+    if (this.reviewSentTimer) clearTimeout(this.reviewSentTimer);
   }
 
   open() {
@@ -1127,6 +1144,10 @@ class AgentNudgeWidget extends HTMLElement {
     this.shell.dataset.open = String(this.opened);
     this.shell.dataset.review = String(this.reviewOpen);
     this.shell.dataset.capturing = String(this.mode !== "idle");
+    this.launcher.dataset.sent = String(this.reviewSent);
+    this.launcher.innerHTML = this.reviewSent ? iconCheck : iconMessage;
+    this.launcher.title = this.reviewSent ? "Feedback sent" : "Open comments toolbar";
+    this.launcher.ariaLabel = this.launcher.title;
     for (const mode of ["element", "region", "drawing"]) {
       const button = this.shadowRoot.querySelector(`.attach-${mode}`);
       button.dataset.active = String(this.mode === mode);

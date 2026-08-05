@@ -556,6 +556,10 @@ fn broker_router(state: BrokerState) -> Router {
             post(submit_message).options(browser_preflight),
         )
         .route(
+            "/{session_id}/feedback",
+            post(submit_feedback).options(browser_preflight),
+        )
+        .route(
             "/{session_id}/conversation",
             get(conversation).options(browser_preflight),
         )
@@ -1662,6 +1666,45 @@ async fn submit_message(
     headers: HeaderMap,
     Json(submission): Json<ChatSubmission>,
 ) -> Response<Body> {
+    submit_browser_message(
+        session_id,
+        state,
+        headers,
+        submission,
+        BrowserSubmissionKind::Chat,
+    )
+    .await
+}
+
+async fn submit_feedback(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(submission): Json<ChatSubmission>,
+) -> Response<Body> {
+    submit_browser_message(
+        session_id,
+        state,
+        headers,
+        submission,
+        BrowserSubmissionKind::Feedback,
+    )
+    .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BrowserSubmissionKind {
+    Chat,
+    Feedback,
+}
+
+async fn submit_browser_message(
+    session_id: String,
+    state: BrokerState,
+    headers: HeaderMap,
+    submission: ChatSubmission,
+    kind: BrowserSubmissionKind,
+) -> Response<Body> {
     let Some(session) = find_session(&state, &session_id).await else {
         return (StatusCode::NOT_FOUND, Body::empty()).into_response();
     };
@@ -1713,17 +1756,7 @@ async fn submit_message(
         }
     };
 
-    let chat_message = ChatMessage {
-        id: message_id.clone(),
-        sequence,
-        role: ChatRole::User,
-        text: submission.text,
-        created_at_unix_ms: received_at_unix_ms,
-        in_reply_to: None,
-        attachments: submission.attachments,
-        image_attachments: vec![],
-    };
-    let runtime_message = RuntimeUserMessage {
+    let runtime_message = (kind == BrowserSubmissionKind::Chat).then(|| RuntimeUserMessage {
         message_id: inbound.message_id.clone(),
         text: inbound.text.clone(),
         manifest_path: inbound.manifest_path.clone(),
@@ -1733,28 +1766,40 @@ async fn submit_message(
             .iter()
             .map(|attachment| attachment.summary.clone())
             .collect(),
-    };
-    {
-        let mut conversation = session.conversation.lock().await;
-        conversation.messages.push(chat_message);
-        conversation.inbound.push_back(inbound);
+    });
+    let mut conversation = session.conversation.lock().await;
+    if kind == BrowserSubmissionKind::Chat {
+        conversation.messages.push(ChatMessage {
+            id: message_id.clone(),
+            sequence,
+            role: ChatRole::User,
+            text: submission.text,
+            created_at_unix_ms: received_at_unix_ms,
+            in_reply_to: None,
+            attachments: submission.attachments,
+            image_attachments: vec![],
+        });
     }
+    conversation.inbound.push_back(inbound);
+    drop(conversation);
     session.inbound_notify.notify_waiters();
-    session.transcript_notify.notify_waiters();
-    if let Some(runtime) = session.runtime.lock().await.clone()
-        && let Err(error) = runtime.send_user_message(runtime_message).await
-    {
-        let _ = record_agent_reply(
-            &session,
-            PreparedAgentReply {
-                message: format!("Embedded agent runtime error: {error}"),
-                in_reply_to: Some(message_id.clone()),
-                attachments: vec![],
-            },
-        )
-        .await;
-    } else {
-        let _ = persist_active_transcript(&session).await;
+    if let Some(runtime_message) = runtime_message {
+        session.transcript_notify.notify_waiters();
+        if let Some(runtime) = session.runtime.lock().await.clone()
+            && let Err(error) = runtime.send_user_message(runtime_message).await
+        {
+            let _ = record_agent_reply(
+                &session,
+                PreparedAgentReply {
+                    message: format!("Embedded agent runtime error: {error}"),
+                    in_reply_to: Some(message_id.clone()),
+                    attachments: vec![],
+                },
+            )
+            .await;
+        } else {
+            let _ = persist_active_transcript(&session).await;
+        }
     }
 
     cors_json(
@@ -3132,6 +3177,39 @@ mod tests {
         assert_eq!(transcript.messages.len(), 2);
         assert!(matches!(transcript.messages[0].role, ChatRole::User));
         assert!(matches!(transcript.messages[1].role, ChatRole::Agent));
+    }
+
+    #[tokio::test]
+    async fn feedback_wakes_the_main_agent_without_entering_chat() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+
+        let submitted = submit_feedback(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(submission(&created.session)),
+        )
+        .await;
+        assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+        let receipt: MessageReceipt = response_json(submitted).await;
+
+        let received = wait_on_session(&session, Duration::ZERO).await;
+        assert_eq!(received.status, "message");
+        assert_eq!(
+            received.message.as_ref().unwrap().message_id,
+            receipt.message_id
+        );
+        assert!(session.conversation.lock().await.messages.is_empty());
     }
 
     #[tokio::test]

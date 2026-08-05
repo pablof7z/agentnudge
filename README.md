@@ -2,7 +2,7 @@
 
 AgentNudge is a tiny local visual-feedback bridge between a person looking at software and the coding agent working on it.
 
-A development-only message button opens a sidebar directly in the website. Chat mode supports questions and change requests with page elements, rectangular regions, or freehand drawings attached to individual messages. Comments mode supports a review pass with draggable, editable sticky notes, drawings, area marks, undo/redo, and one batch send. AgentNudge can wake the current harness through a foreground wait, or route the conversation through a per-session Codex or Claude runtime whose replies appear directly in the sidebar.
+A development-only message button opens a sidebar directly in the website. Chat mode supports questions and change requests with page elements, rectangular regions, or freehand drawings attached to individual messages. Comments mode supports a review pass with draggable, editable sticky notes, drawings, area marks, undo/redo, and one batch send. That batch wakes the main harness through its foreground wait without entering chat; only Chat-mode messages route through a per-session Codex or Claude runtime whose replies appear directly in the sidebar.
 
 The local/manual bridge needs no account, hosted service, browser extension, or multi-computer transport. Embedded modes use the machine's existing Codex or Claude authentication.
 
@@ -36,7 +36,7 @@ agentnudge session \
 
 Claude mode launches the pinned `@agentclientprotocol/claude-agent-acp` package through `npx` and reuses the local Claude login. Pass `--runtime-bin /path/to/claude-agent-acp` to use an already-installed adapter instead.
 
-The command prints the ready record, then remains in the foreground. Keep its process handle. Each browser message is sent to the session's private runtime conversation. Codex uses `turn/steer` while active. Claude follows standard ACP and queues a new `session/prompt` until the current prompt completes. Completed agent messages appear in the sidebar.
+The command prints the ready record, then remains in the foreground. Keep its process handle. Each Chat-mode browser message is sent to the session's private runtime conversation. Codex uses `turn/steer` while active. Claude follows standard ACP and queues a new `session/prompt` until the current prompt completes. Completed agent messages appear in the sidebar. Comments-mode batch feedback bypasses that runtime and wakes the main harness instead.
 
 The trusted `--context` (or `--context-file`) is applied at Codex `thread/start` or appended to Claude Code's system prompt at ACP `session/new`. Browser messages, captures, manifests, and page text stay untrusted user input. The annotated screenshot is supplied as an image along with its evidence paths.
 
