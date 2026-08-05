@@ -2870,6 +2870,7 @@ mod tests {
                     height: 40.0,
                 }),
                 element: None,
+                comment: None,
                 strokes: vec![],
             }],
             screenshot_data_url: ONE_PIXEL_PNG.into(),

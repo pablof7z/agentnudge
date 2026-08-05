@@ -9,9 +9,12 @@
   },
   "dependencies": {
     "@tabler/icons": "^3.46.0",
-    "html2canvas": "^1.4.1"
+    "dompurify": "^3.4.13",
+    "html2canvas": "^1.4.1",
+    "marked": "^18.0.9"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0"
+    "esbuild": "^0.25.0",
+    "jsdom": "^27.4.0"
   }
 }

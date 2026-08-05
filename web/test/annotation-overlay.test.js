@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { pointInClosedPath, rectanglePoints } from "../src/annotation-geometry.js";
-import { paintMessageAttachments } from "../src/annotation-overlay.js";
+import { paintCommentReview, paintMessageAttachments } from "../src/annotation-overlay.js";
 
 test("turns an area drag into a closed rectangle path", () => {
   const points = rectanglePoints({ x: 20, y: 30, width: 100, height: 40 });
@@ -49,6 +49,47 @@ test("resets the screenshot transform and paints numbered attachments", () => {
     ["stroke", "stroke-1"],
     ["stroke", "stroke-2"],
     ["marker", "attachment-1", { x: 20, y: 30, width: 100, height: 40 }, 1],
+    ["restore"],
+  ]);
+});
+
+test("paints drawings and complete sticky notes into review screenshots", () => {
+  const calls = [];
+  const context = {
+    save: () => calls.push(["save"]),
+    setTransform: (...values) => calls.push(["setTransform", ...values]),
+    restore: () => calls.push(["restore"]),
+  };
+  const comment = {
+    id: "comment-1",
+    message: "Move this below the heading",
+    cardPosition: { x: 200, y: 80 },
+  };
+
+  paintCommentReview({
+    context,
+    canvas: { width: 1_800, height: 1_200 },
+    viewport: { width: 900, height: 600 },
+    strokes: [{ id: "stroke-1" }],
+    comments: [comment],
+    resolveCommentRect: () => ({ x: 20, y: 30, width: 100, height: 40 }),
+    paintStroke: (_context, stroke) => calls.push(["stroke", stroke.id]),
+    paintSticky: (_context, value, rect, position, number) => {
+      calls.push(["sticky", value.message, rect, position, number]);
+    },
+  });
+
+  assert.deepEqual(calls, [
+    ["save"],
+    ["setTransform", 2, 0, 0, 2, 0, 0],
+    ["stroke", "stroke-1"],
+    [
+      "sticky",
+      "Move this below the heading",
+      { x: 20, y: 30, width: 100, height: 40 },
+      { x: 200, y: 80 },
+      1,
+    ],
     ["restore"],
   ]);
 });

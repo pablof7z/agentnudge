@@ -1,8 +1,8 @@
 # AgentNudge
 
-AgentNudge is a tiny local chat bridge between a person looking at software and the coding agent working on it.
+AgentNudge is a tiny local visual-feedback bridge between a person looking at software and the coding agent working on it.
 
-A development-only message button opens a sidebar directly in the website. You can ask the agent a question or request a change, and attach page elements, rectangular regions, or freehand drawings to the message. AgentNudge can wake the current harness through a foreground wait, or route the conversation through a per-session Codex or Claude runtime whose replies appear directly in the sidebar.
+A development-only message button opens a sidebar directly in the website. Chat mode supports questions and change requests with page elements, rectangular regions, or freehand drawings attached to individual messages. Comments mode supports a review pass with draggable, editable sticky notes, drawings, area marks, undo/redo, and one batch send. AgentNudge can wake the current harness through a foreground wait, or route the conversation through a per-session Codex or Claude runtime whose replies appear directly in the sidebar.
 
 The local/manual bridge needs no account, hosted service, browser extension, or multi-computer transport. Embedded modes use the machine's existing Codex or Claude authentication.
 
@@ -236,7 +236,9 @@ If the returned session is `lima`, open:
 http://localhost:5173/?agentnudge=lima
 ```
 
-Click the small message icon. Write directly in the sidebar. The pointer attaches an element, the dashed square attaches a rectangular area, and the pencil lets you draw on the page. Every attachment appears as a numbered chip beside the composer and as the matching numbered mark on the page. Press Enter or the coral send button to send everything as one chat message.
+Click the small launcher to enter Comments mode by default. Its compact icon toolbar restores the page-review workflow: select a drawing, add a draggable sticky note anywhere or against an element/dragged region, draw freehand, mark an area, open a page-level comment, undo/redo, or delete selected ink. Double-click saved sticky text to edit it. The coral send button submits the page comment, every sticky, every mark, and the composited screenshot together, then returns to Chat mode.
+
+Press the chat-bubble icon at the start of the Comments toolbar to open Chat mode. Write directly in the sidebar. The pointer attaches an element, the dashed square attaches a rectangular area, and the pencil lets you draw on the page. Every attachment appears inside its message bubble and as the matching numbered mark on the page. Press Enter or the coral send button to send one chat message. The note icon in the chat header returns to Comments mode.
 
 In the agent terminal, wait for it:
 
@@ -262,9 +264,10 @@ Every user message can contain:
 - A sanitized page URL with query and fragment removed.
 - Viewport and scroll coordinates.
 - Any number of numbered element, region, and drawing attachments.
+- Optional sticky-note text attached to a specific element or region.
 - Element metadata: tag, role, accessible name, bounded text, classes, selector, and visible rectangle.
 - Bounded freehand point sequences.
-- An annotated screenshot containing the selected regions, drawings, and matching attachment numbers.
+- An annotated screenshot containing the selected regions, drawings, matching attachment numbers, and Comments-mode sticky cards.
 
 Clicking an attachment in a sent sidebar message shows its marks on the page again. Old marks otherwise stay hidden so the website does not become cluttered.
 
