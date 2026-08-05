@@ -18,6 +18,7 @@ export function createReviewThread({ id, number, cardPosition, anchor }) {
     draft: "",
     feedbackText: "",
     conversation: [],
+    cursor: 0,
     asking: false,
     pending: false,
   };
@@ -36,22 +37,6 @@ export function threadDisplayText(thread) {
   return latestUserMessage || "Marked context";
 }
 
-export function prototypeAgentReply(thread) {
-  const labels = thread.references.map((_, index) => referenceLabel(thread, index));
-  const targets = thread.references
-    .filter((reference) => reference.kind === "element")
-    .map((reference) => reference.element?.accessibleName || reference.element?.tag)
-    .filter(Boolean)
-    .slice(0, 3);
-  const referenceText = labels.length
-    ? labels.length === 1
-      ? labels[0]
-      : `${labels.slice(0, -1).join(", ")} and ${labels.at(-1)}`
-    : "this page note";
-  const targetText = targets.length ? ` (${targets.join(", ")})` : "";
-  return `I’m looking at ${referenceText}${targetText}. This is a prototype response so you can test the inline thread; the real version would ask the embedded agent with exactly this grouped context.`;
-}
-
 export function buildGroupedReviewPayload({ sessionId, threads, page, screenshotDataUrl }) {
   return {
     sessionId,
@@ -60,6 +45,28 @@ export function buildGroupedReviewPayload({ sessionId, threads, page, screenshot
     attachments: groupedReviewAttachments(threads),
     screenshotDataUrl,
   };
+}
+
+export function buildThreadQuestionPayload({ sessionId, thread, question, page, screenshotDataUrl }) {
+  return {
+    sessionId,
+    text: question,
+    page,
+    attachments: groupedReviewAttachments([thread]),
+    screenshotDataUrl,
+  };
+}
+
+export function reviewThreadMessagesUrl(endpoint, threadId) {
+  return `${endpoint}/review/threads/${encodeURIComponent(threadId)}/messages`;
+}
+
+export function reviewThreadConversationUrl(endpoint, threadId, cursor) {
+  return `${endpoint}/review/threads/${encodeURIComponent(threadId)}/conversation?after=${cursor}`;
+}
+
+export function reviewDraftUrl(endpoint) {
+  return `${endpoint}/review/draft`;
 }
 
 export function groupedReviewText(threads) {

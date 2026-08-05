@@ -36,10 +36,12 @@ use crate::model::{
     ChatSubmission, ConversationResponse, InboundMessage, MAX_BROWSER_FILL_CHARS,
     MAX_BROWSER_RESULT_BYTES, MAX_BROWSER_SELECTOR_CHARS, MAX_REPLY_IMAGE_ATTACHMENTS,
     MAX_REPLY_IMAGE_BYTES, MAX_REPLY_IMAGE_TOTAL_BYTES, MAX_SCREENSHOT_BYTES, MessageManifest,
-    MessageReceipt, PROTOCOL_VERSION, ReplyImageAttachment, ReplyReceipt, TrustBoundary,
+    MessageReceipt, PROTOCOL_VERSION, ReplyImageAttachment, ReplyReceipt,
+    ReviewConversationResponse, TrustBoundary,
 };
 use crate::runtime::{
-    RuntimeEvent, RuntimeHandle, RuntimeLaunchConfig, RuntimeSnapshot, RuntimeUserMessage,
+    RuntimeEvent, RuntimeHandle, RuntimeLaunchConfig, RuntimeMessageChannel, RuntimeReplyTarget,
+    RuntimeSnapshot, RuntimeUserMessage,
 };
 use crate::stt;
 
@@ -164,6 +166,13 @@ struct ConversationQuery {
     after: u64,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReviewDraftSubmission {
+    session_id: String,
+    state: serde_json::Value,
+}
+
 #[derive(Deserialize)]
 struct WaitQuery {
     timeout_ms: u64,
@@ -193,6 +202,12 @@ struct Conversation {
     inbound: VecDeque<InboundMessage>,
 }
 
+#[derive(Default)]
+struct ReviewConversation {
+    next_sequence: u64,
+    messages: Vec<ChatMessage>,
+}
+
 #[derive(Clone)]
 struct SessionState {
     allowed_origin: String,
@@ -201,11 +216,15 @@ struct SessionState {
     browser_token: String,
     output: PathBuf,
     transcript_path: PathBuf,
+    review_draft_path: PathBuf,
     started_at_unix_ms: u128,
     conversation: Arc<Mutex<Conversation>>,
+    review_conversations: Arc<Mutex<HashMap<String, ReviewConversation>>>,
+    review_draft: Arc<Mutex<Option<serde_json::Value>>>,
     reply_assets: Arc<Mutex<HashMap<String, StoredReplyAsset>>>,
     inbound_notify: Arc<Notify>,
     transcript_notify: Arc<Notify>,
+    review_notify: Arc<Notify>,
     browser_control_enabled: bool,
     browser_control: Arc<Mutex<BrowserControlState>>,
     browser_command_notify: Arc<Notify>,
@@ -560,6 +579,21 @@ fn broker_router(state: BrokerState) -> Router {
             post(submit_feedback).options(browser_preflight),
         )
         .route(
+            "/{session_id}/review/threads/{thread_id}/messages",
+            post(submit_review_message).options(browser_review_preflight),
+        )
+        .route(
+            "/{session_id}/review/threads/{thread_id}/conversation",
+            get(review_conversation).options(browser_review_preflight),
+        )
+        .route(
+            "/{session_id}/review/draft",
+            get(review_draft)
+                .put(save_review_draft)
+                .delete(clear_review_draft)
+                .options(browser_preflight),
+        )
+        .route(
             "/{session_id}/conversation",
             get(conversation).options(browser_preflight),
         )
@@ -701,12 +735,16 @@ async fn register_session_with_runtime(
         session_id: session_id.clone(),
         browser_token: capability_token(),
         transcript_path: output.join("transcript.json"),
+        review_draft_path: output.join("review-draft.json"),
         output,
         started_at_unix_ms: unix_time_ms()?,
         conversation: Arc::new(Mutex::new(Conversation::default())),
+        review_conversations: Arc::new(Mutex::new(HashMap::new())),
+        review_draft: Arc::new(Mutex::new(None)),
         reply_assets: Arc::new(Mutex::new(HashMap::new())),
         inbound_notify: Arc::new(Notify::new()),
         transcript_notify: Arc::new(Notify::new()),
+        review_notify: Arc::new(Notify::new()),
         browser_control_enabled,
         browser_control: Arc::new(Mutex::new(BrowserControlState::default())),
         browser_command_notify: Arc::new(Notify::new()),
@@ -1110,6 +1148,40 @@ async fn record_agent_reply(
     })
 }
 
+async fn record_review_reply(
+    state: &SessionState,
+    thread_id: &str,
+    message: String,
+    in_reply_to: Option<String>,
+) -> Result<ReplyReceipt> {
+    let created_at_unix_ms = unix_time_ms()?;
+    let message_id = Uuid::new_v4().to_string();
+    let sequence = {
+        let mut review = state.review_conversations.lock().await;
+        let conversation = review.entry(thread_id.to_owned()).or_default();
+        conversation.next_sequence += 1;
+        let sequence = conversation.next_sequence;
+        conversation.messages.push(ChatMessage {
+            id: message_id.clone(),
+            sequence,
+            role: ChatRole::Agent,
+            text: message,
+            created_at_unix_ms,
+            in_reply_to,
+            attachments: vec![],
+            image_attachments: vec![],
+        });
+        sequence
+    };
+    state.review_notify.notify_waiters();
+    Ok(ReplyReceipt {
+        version: PROTOCOL_VERSION,
+        status: "accepted".into(),
+        message_id,
+        sequence,
+    })
+}
+
 fn prepare_agent_reply(submission: AgentReplySubmission) -> Result<PreparedAgentReply, String> {
     let submission = submission.validate_and_sanitize()?;
     let mut total_bytes = 0usize;
@@ -1267,6 +1339,7 @@ async fn widget(
             json!({"error": "origin_not_allowed"}),
         );
     }
+    let runtime_enabled = session.runtime.lock().await.is_some();
     let script = WIDGET_SOURCE
         .replace("__AGENTNUDGE_ENDPOINT__", &session.endpoint)
         .replace("__AGENTNUDGE_ORIGIN__", &session.allowed_origin)
@@ -1279,6 +1352,10 @@ async fn widget(
             } else {
                 "false"
             },
+        )
+        .replace(
+            "__AGENTNUDGE_RUNTIME_ENABLED__",
+            if runtime_enabled { "true" } else { "false" },
         );
     let mut response = Response::new(Body::from(script));
     response.headers_mut().insert(
@@ -1294,6 +1371,27 @@ async fn widget(
 
 async fn browser_preflight(
     AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if !valid_origin(&headers, &session.allowed_origin) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::FORBIDDEN,
+            json!({"error": "origin_not_allowed"}),
+        );
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    apply_cors_headers(&mut response, &session.allowed_origin);
+    response
+}
+
+async fn browser_review_preflight(
+    AxumPath((session_id, _thread_id)): AxumPath<(String, String)>,
     State(state): State<BrokerState>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -1758,6 +1856,7 @@ async fn submit_browser_message(
 
     let runtime_message = (kind == BrowserSubmissionKind::Chat).then(|| RuntimeUserMessage {
         message_id: inbound.message_id.clone(),
+        channel: RuntimeMessageChannel::Chat,
         text: inbound.text.clone(),
         manifest_path: inbound.manifest_path.clone(),
         screenshot_path: inbound.screenshot_path.clone(),
@@ -1801,6 +1900,14 @@ async fn submit_browser_message(
             let _ = persist_active_transcript(&session).await;
         }
     }
+    if kind == BrowserSubmissionKind::Feedback
+        && let Err(error) = clear_review_draft_state(&session).await
+    {
+        eprintln!(
+            "AgentNudge could not clear the submitted review draft for {}: {error:#}",
+            session.session_id
+        );
+    }
 
     cors_json(
         &session.allowed_origin,
@@ -1812,6 +1919,316 @@ async fn submit_browser_message(
             sequence,
         },
     )
+}
+
+async fn submit_review_message(
+    AxumPath((session_id, thread_id)): AxumPath<(String, String)>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(submission): Json<ChatSubmission>,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    if let Err(message) = validate_review_thread_id(&thread_id) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "invalid_review_thread", "message": message}),
+        );
+    }
+    let Some(runtime) = session.runtime.lock().await.clone() else {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::CONFLICT,
+            json!({
+                "error": "runtime_unavailable",
+                "message": "this session has no embedded agent runtime"
+            }),
+        );
+    };
+    let submission = match submission.validate_and_sanitize(&session.session_id) {
+        Ok(value) => value,
+        Err(message) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"error": "invalid_message", "message": message}),
+            );
+        }
+    };
+
+    let message_id = Uuid::new_v4().to_string();
+    let received_at_unix_ms = match unix_time_ms() {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "clock_error", "message": error.to_string()}),
+            );
+        }
+    };
+    let sequence = {
+        let mut review = session.review_conversations.lock().await;
+        let conversation = review.entry(thread_id.clone()).or_default();
+        conversation.next_sequence += 1;
+        conversation.next_sequence
+    };
+    let inbound = match persist_message(
+        &submission,
+        &session.output,
+        &session.session_id,
+        &message_id,
+        sequence,
+        received_at_unix_ms,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "persist_failed", "message": error.to_string()}),
+            );
+        }
+    };
+
+    let runtime_message = RuntimeUserMessage {
+        message_id: inbound.message_id.clone(),
+        channel: RuntimeMessageChannel::ReviewThread(thread_id.clone()),
+        text: inbound.text.clone(),
+        manifest_path: inbound.manifest_path.clone(),
+        screenshot_path: inbound.screenshot_path.clone(),
+        attachment_summaries: inbound
+            .attachments
+            .iter()
+            .map(|attachment| attachment.summary.clone())
+            .collect(),
+    };
+    {
+        let mut review = session.review_conversations.lock().await;
+        review
+            .entry(thread_id.clone())
+            .or_default()
+            .messages
+            .push(ChatMessage {
+                id: message_id.clone(),
+                sequence,
+                role: ChatRole::User,
+                text: submission.text,
+                created_at_unix_ms: received_at_unix_ms,
+                in_reply_to: None,
+                attachments: submission.attachments,
+                image_attachments: vec![],
+            });
+    }
+    session.review_notify.notify_waiters();
+    if let Err(error) = runtime.send_user_message(runtime_message).await {
+        let _ = record_review_reply(
+            &session,
+            &thread_id,
+            format!("Embedded agent runtime error: {error}"),
+            Some(message_id.clone()),
+        )
+        .await;
+    }
+
+    cors_json(
+        &session.allowed_origin,
+        StatusCode::ACCEPTED,
+        &MessageReceipt {
+            version: PROTOCOL_VERSION,
+            status: "accepted".into(),
+            message_id,
+            sequence,
+        },
+    )
+}
+
+async fn review_conversation(
+    AxumPath((session_id, thread_id)): AxumPath<(String, String)>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Query(query): Query<ConversationQuery>,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    if let Err(message) = validate_review_thread_id(&thread_id) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "invalid_review_thread", "message": message}),
+        );
+    }
+
+    let deadline = Duration::from_secs(20);
+    loop {
+        let notified = session.review_notify.notified();
+        let response = {
+            let review = session.review_conversations.lock().await;
+            let messages: Vec<_> = review
+                .get(&thread_id)
+                .into_iter()
+                .flat_map(|conversation| conversation.messages.iter())
+                .filter(|message| message.sequence > query.after)
+                .cloned()
+                .collect();
+            if messages.is_empty() {
+                None
+            } else {
+                Some(ReviewConversationResponse {
+                    version: PROTOCOL_VERSION,
+                    thread_id: thread_id.clone(),
+                    cursor: messages.last().map_or(query.after, |value| value.sequence),
+                    messages,
+                })
+            }
+        };
+        if let Some(response) = response {
+            return cors_json(&session.allowed_origin, StatusCode::OK, &response);
+        }
+        if session.ended.load(Ordering::Acquire) {
+            return cors_json(
+                &session.allowed_origin,
+                StatusCode::GONE,
+                &ReviewConversationResponse {
+                    version: PROTOCOL_VERSION,
+                    thread_id,
+                    messages: vec![],
+                    cursor: query.after,
+                },
+            );
+        }
+        if tokio::time::timeout(deadline, notified).await.is_err() {
+            return cors_json(
+                &session.allowed_origin,
+                StatusCode::OK,
+                &ReviewConversationResponse {
+                    version: PROTOCOL_VERSION,
+                    thread_id,
+                    messages: vec![],
+                    cursor: query.after,
+                },
+            );
+        }
+    }
+}
+
+async fn review_draft(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    let draft = session.review_draft.lock().await.clone();
+    let conversations: HashMap<_, _> = session
+        .review_conversations
+        .lock()
+        .await
+        .iter()
+        .map(|(thread_id, conversation)| (thread_id.clone(), conversation.messages.clone()))
+        .collect();
+    cors_json(
+        &session.allowed_origin,
+        StatusCode::OK,
+        &json!({
+            "version": PROTOCOL_VERSION,
+            "status": "ready",
+            "state": draft,
+            "conversations": conversations,
+        }),
+    )
+}
+
+async fn save_review_draft(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(submission): Json<ReviewDraftSubmission>,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    if submission.session_id != session.session_id {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "invalid_review_draft", "message": "sessionId does not match the widget session"}),
+        );
+    }
+    if let Err(message) = validate_review_draft(&submission.state) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "invalid_review_draft", "message": message}),
+        );
+    }
+    let mut draft = session.review_draft.lock().await;
+    if let Err(error) = write_private_json_atomic(&session.review_draft_path, &submission) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "persist_failed", "message": error.to_string()}),
+        );
+    }
+    *draft = Some(submission.state);
+    cors_json(
+        &session.allowed_origin,
+        StatusCode::ACCEPTED,
+        &json!({"version": PROTOCOL_VERSION, "status": "saved"}),
+    )
+}
+
+async fn clear_review_draft(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    match clear_review_draft_state(&session).await {
+        Ok(()) => cors_json(
+            &session.allowed_origin,
+            StatusCode::OK,
+            &json!({"version": PROTOCOL_VERSION, "status": "cleared"}),
+        ),
+        Err(error) => json_response(
+            &session.allowed_origin,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "clear_failed", "message": error.to_string()}),
+        ),
+    }
+}
+
+async fn clear_review_draft_state(session: &SessionState) -> Result<()> {
+    let mut draft = session.review_draft.lock().await;
+    if session.review_draft_path.exists() {
+        std::fs::remove_file(&session.review_draft_path)
+            .with_context(|| format!("could not remove {}", session.review_draft_path.display()))?;
+    }
+    *draft = None;
+    session.review_conversations.lock().await.clear();
+    session.review_notify.notify_waiters();
+    Ok(())
 }
 
 async fn conversation(
@@ -1907,20 +2324,34 @@ fn spawn_runtime_event_listener(
             if session.ended.load(Ordering::Acquire) {
                 break;
             }
-            let message = match event {
-                RuntimeEvent::AssistantMessage(message) => message,
-                RuntimeEvent::Error(message) => format!("Embedded agent runtime error: {message}"),
-            };
-            if let Err(error) = record_agent_reply(
-                &session,
-                PreparedAgentReply {
+            let result = match event {
+                RuntimeEvent::AssistantMessage { message, target } => {
+                    record_targeted_runtime_message(&session, message, target)
+                        .await
+                        .map(|_| ())
+                }
+                RuntimeEvent::Error {
                     message,
-                    in_reply_to: None,
-                    attachments: vec![],
-                },
-            )
-            .await
-            {
+                    target: Some(target),
+                } => record_targeted_runtime_message(
+                    &session,
+                    format!("Embedded agent runtime error: {message}"),
+                    Some(target),
+                )
+                .await
+                .map(|_| ()),
+                RuntimeEvent::Error {
+                    message,
+                    target: None,
+                } => {
+                    record_unrouted_runtime_error(
+                        &session,
+                        format!("Embedded agent runtime error: {message}"),
+                    )
+                    .await
+                }
+            };
+            if let Err(error) = result {
                 eprintln!(
                     "AgentNudge could not record embedded agent output for {}: {error:#}",
                     session.session_id
@@ -1928,6 +2359,88 @@ fn spawn_runtime_event_listener(
             }
         }
     });
+}
+
+async fn record_targeted_runtime_message(
+    session: &SessionState,
+    message: String,
+    target: Option<RuntimeReplyTarget>,
+) -> Result<ReplyReceipt> {
+    match target {
+        Some(RuntimeReplyTarget {
+            message_id,
+            channel: RuntimeMessageChannel::Chat,
+        }) => {
+            record_agent_reply(
+                session,
+                PreparedAgentReply {
+                    message,
+                    in_reply_to: Some(message_id),
+                    attachments: vec![],
+                },
+            )
+            .await
+        }
+        Some(RuntimeReplyTarget {
+            message_id,
+            channel: RuntimeMessageChannel::ReviewThread(thread_id),
+        }) => record_review_reply(session, &thread_id, message, Some(message_id)).await,
+        None => {
+            record_agent_reply(
+                session,
+                PreparedAgentReply {
+                    message,
+                    in_reply_to: None,
+                    attachments: vec![],
+                },
+            )
+            .await
+        }
+    }
+}
+
+async fn record_unrouted_runtime_error(session: &SessionState, message: String) -> Result<()> {
+    let chat_reply_to = session
+        .conversation
+        .lock()
+        .await
+        .messages
+        .last()
+        .filter(|message| matches!(message.role, ChatRole::User))
+        .map(|message| message.id.clone());
+    let review_replies: Vec<_> = session
+        .review_conversations
+        .lock()
+        .await
+        .iter()
+        .filter_map(|(thread_id, conversation)| {
+            conversation
+                .messages
+                .last()
+                .filter(|message| matches!(message.role, ChatRole::User))
+                .map(|message| (thread_id.clone(), message.id.clone()))
+        })
+        .collect();
+    let had_pending = chat_reply_to.is_some() || !review_replies.is_empty();
+
+    if let Some(message_id) = chat_reply_to {
+        record_agent_reply(
+            session,
+            PreparedAgentReply {
+                message: message.clone(),
+                in_reply_to: Some(message_id),
+                attachments: vec![],
+            },
+        )
+        .await?;
+    }
+    for (thread_id, message_id) in review_replies {
+        record_review_reply(session, &thread_id, message.clone(), Some(message_id)).await?;
+    }
+    if !had_pending {
+        record_targeted_runtime_message(session, message, None).await?;
+    }
+    Ok(())
 }
 
 async fn current_transcript(state: &BrokerState, session_id: &str) -> Option<SessionTranscript> {
@@ -2019,6 +2532,7 @@ async fn finish_session(state: &BrokerState, session_id: &str) -> Result<Session
 
     session.inbound_notify.notify_waiters();
     session.transcript_notify.notify_waiters();
+    session.review_notify.notify_waiters();
     session.browser_command_notify.notify_waiters();
     session.completion_notify.notify_waiters();
     Ok(transcript)
@@ -2278,6 +2792,57 @@ fn validate_session_id(value: &str) -> Result<String> {
     } else {
         bail!("the session id must be an active NATO word such as `lima`")
     }
+}
+
+fn validate_review_thread_id(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() || value.len() > 64 {
+        return Err("the review thread id must contain between 1 and 64 characters");
+    }
+    if !value
+        .bytes()
+        .all(|value| value.is_ascii_alphanumeric() || value == b'-' || value == b'_')
+    {
+        return Err(
+            "the review thread id may contain only letters, numbers, hyphens, and underscores",
+        );
+    }
+    Ok(())
+}
+
+fn validate_review_draft(state: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(state) = state.as_object() else {
+        return Err("review state must be an object");
+    };
+    let Some(threads) = state.get("threads").and_then(serde_json::Value::as_array) else {
+        return Err("review state must contain a threads array");
+    };
+    if threads.len() > 100 {
+        return Err("review state cannot contain more than 100 threads");
+    }
+    for thread in threads {
+        let Some(thread) = thread.as_object() else {
+            return Err("each review thread must be an object");
+        };
+        let Some(thread_id) = thread.get("id").and_then(serde_json::Value::as_str) else {
+            return Err("each review thread must have an id");
+        };
+        validate_review_thread_id(thread_id)?;
+        if thread
+            .get("references")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|references| references.len() > 100)
+        {
+            return Err("each review thread must contain at most 100 references");
+        }
+        if thread
+            .get("conversation")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|messages| messages.len() > 200)
+        {
+            return Err("each review thread must contain at most 200 messages");
+        }
+    }
+    Ok(())
 }
 
 fn validate_wait(duration: Duration) -> Result<()> {
@@ -3002,11 +3567,15 @@ mod tests {
             browser_token: String::new(),
             output: PathBuf::new(),
             transcript_path: PathBuf::new(),
+            review_draft_path: PathBuf::new(),
             started_at_unix_ms: 0,
             conversation: Arc::new(Mutex::new(Conversation::default())),
+            review_conversations: Arc::new(Mutex::new(HashMap::new())),
+            review_draft: Arc::new(Mutex::new(None)),
             reply_assets: Arc::new(Mutex::new(HashMap::new())),
             inbound_notify: Arc::new(Notify::new()),
             transcript_notify: Arc::new(Notify::new()),
+            review_notify: Arc::new(Notify::new()),
             browser_control_enabled: false,
             browser_control: Arc::new(Mutex::new(BrowserControlState::default())),
             browser_command_notify: Arc::new(Notify::new()),
@@ -3213,6 +3782,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn feedback_clears_the_persisted_review_draft() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        let state = json!({
+            "threadCounter": 1,
+            "referenceCounter": 0,
+            "strokeCounter": 0,
+            "threads": [{
+                "id": "thread-1",
+                "references": [],
+                "conversation": [],
+            }],
+        });
+
+        let saved = save_review_draft(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(ReviewDraftSubmission {
+                session_id: created.session.clone(),
+                state: state.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::ACCEPTED);
+        assert!(session.review_draft_path.is_file());
+
+        let restored = review_draft(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+        )
+        .await;
+        let restored: serde_json::Value = response_json(restored).await;
+        assert_eq!(restored["state"], state);
+
+        let feedback = submit_feedback(
+            AxumPath(created.session.clone()),
+            State(broker),
+            browser_headers(&session),
+            Json(submission(&created.session)),
+        )
+        .await;
+        assert_eq!(feedback.status(), StatusCode::ACCEPTED);
+        assert!(session.review_draft.lock().await.is_none());
+        assert!(!session.review_draft_path.exists());
+    }
+
+    #[tokio::test]
+    async fn inline_review_questions_require_an_embedded_runtime() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+
+        let response = submit_review_message(
+            AxumPath((created.session.clone(), "thread-1".into())),
+            State(broker),
+            browser_headers(&session),
+            Json(submission(&created.session)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(session.review_conversations.lock().await.is_empty());
+        assert!(session.conversation.lock().await.inbound.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn review_thread_routes_runtime_reply_without_main_delivery() {
+        use crate::runtime::RuntimeAdapterKind;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let executable = temporary.path().join("fake-codex");
+        let log_path = temporary.path().join("runtime-methods.log");
+        let script = r###"#!/usr/bin/env python3
+import json
+import sys
+
+log = open("__LOG__", "w", buffering=1)
+
+def send(value):
+    print(json.dumps(value), flush=True)
+
+for line in sys.stdin:
+    value = json.loads(line)
+    method = value.get("method")
+    if method:
+        log.write(method + "\n")
+    request_id = value.get("id")
+    if method == "initialize":
+        send({"id": request_id, "result": {"userAgent": "fake"}})
+    elif method == "thread/start":
+        send({"id": request_id, "result": {"thread": {"id": "runtime-thread"}}})
+    elif method == "turn/start":
+        send({"id": request_id, "result": {"turn": {"id": "turn-1"}}})
+        send({"method": "turn/started", "params": {"turn": {"id": "turn-1"}}})
+        send({"method": "item/completed", "params": {"item": {"id": "agent-1", "type": "agentMessage", "text": "They come from different layout containers."}}})
+        send({"method": "turn/completed", "params": {"turn": {"id": "turn-1", "status": "completed"}}})
+    elif method == "turn/interrupt":
+        send({"id": request_id, "result": {}})
+"###
+        .replace("__LOG__", &log_path.display().to_string());
+        std::fs::write(&executable, script).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let broker = broker();
+        let created = register_session_with_runtime(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().join("messages"),
+            false,
+            Some(RuntimeLaunchConfig {
+                adapter: RuntimeAdapterKind::Codex,
+                context: "Answer inline review questions.".into(),
+                cwd: temporary.path().to_path_buf(),
+                executable: Some(executable),
+            }),
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+
+        let submitted = submit_review_message(
+            AxumPath((created.session.clone(), "thread-2".into())),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(submission(&created.session)),
+        )
+        .await;
+        assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+        let receipt: MessageReceipt = response_json(submitted).await;
+
+        let response = review_conversation(
+            AxumPath((created.session.clone(), "thread-2".into())),
+            State(broker.clone()),
+            browser_headers(&session),
+            Query(ConversationQuery {
+                after: receipt.sequence,
+            }),
+        )
+        .await;
+        let response: ReviewConversationResponse = response_json(response).await;
+        assert_eq!(response.thread_id, "thread-2");
+        assert_eq!(response.messages.len(), 1);
+        assert!(matches!(response.messages[0].role, ChatRole::Agent));
+        assert_eq!(
+            response.messages[0].in_reply_to.as_deref(),
+            Some(receipt.message_id.as_str())
+        );
+        assert!(session.conversation.lock().await.messages.is_empty());
+        assert!(session.conversation.lock().await.inbound.is_empty());
+
+        let feedback = submit_feedback(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(submission(&created.session)),
+        )
+        .await;
+        assert_eq!(feedback.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            wait_on_session(&session, Duration::ZERO).await.status,
+            "message"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let runtime_methods = std::fs::read_to_string(log_path).unwrap();
+        assert_eq!(
+            runtime_methods
+                .lines()
+                .filter(|method| *method == "turn/start")
+                .count(),
+            1
+        );
+        assert!(session.conversation.lock().await.messages.is_empty());
+
+        finish_session(&broker, &created.session).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn widget_capability_is_scoped_to_the_allowed_origin() {
         let temporary = tempfile::tempdir().unwrap();
         let broker = broker();
@@ -3257,6 +4023,7 @@ mod tests {
         assert!(script.contains(&session.endpoint));
         assert!(script.contains(&session.browser_token));
         assert!(!script.contains(&broker.agent_token));
+        assert!(!script.contains("__AGENTNUDGE_RUNTIME_ENABLED__"));
     }
 
     #[tokio::test]

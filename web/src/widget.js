@@ -9,7 +9,7 @@ import {
 import { awaitingAgentAfterMessages } from "./chat-state.js";
 import { renderMarkdown } from "./markdown.js";
 import { renderContextAttachments } from "./message-attachments.js";
-import { AgentNudgeReview, REVIEW_HOST_ID } from "./prototype-review-mode.js";
+import { AgentNudgeReview, REVIEW_HOST_ID } from "./review-mode.js";
 import { replyImageLabel, replyImageRequestUrl } from "./reply-images.js";
 import { endSessionRequestUrl } from "./session-lifecycle.js";
 import {

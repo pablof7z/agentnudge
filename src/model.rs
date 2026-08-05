@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-pub const PROTOCOL_VERSION: u8 = 12;
+pub const PROTOCOL_VERSION: u8 = 13;
 pub const MAX_MESSAGE_CHARS: usize = 10_000;
 pub const MAX_ATTACHMENT_COMMENT_CHARS: usize = 5_000;
 pub const MAX_ATTACHMENTS: usize = 100;
@@ -128,6 +128,15 @@ pub struct ChatMessage {
 #[serde(rename_all = "camelCase")]
 pub struct ConversationResponse {
     pub version: u8,
+    pub messages: Vec<ChatMessage>,
+    pub cursor: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewConversationResponse {
+    pub version: u8,
+    pub thread_id: String,
     pub messages: Vec<ChatMessage>,
     pub cursor: u64,
 }

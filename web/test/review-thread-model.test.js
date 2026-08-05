@@ -3,10 +3,13 @@ import test from "node:test";
 
 import {
   buildGroupedReviewPayload,
+  buildThreadQuestionPayload,
   createReviewThread,
   groupedReviewAttachments,
-  prototypeAgentReply,
   referenceLabel,
+  reviewDraftUrl,
+  reviewThreadConversationUrl,
+  reviewThreadMessagesUrl,
 } from "../src/review-thread-model.js";
 
 function thread(number = 1) {
@@ -70,9 +73,37 @@ test("represents an unanchored page note as a tiny region attachment", () => {
   });
 });
 
-test("makes the simulated response explicit about prototype behavior", () => {
+test("builds a thread-scoped question with its grouped context", () => {
   const value = thread();
-  value.references.push({ kind: "region" }, { kind: "region" });
-  assert.match(prototypeAgentReply(value), /1A and 1B/);
-  assert.match(prototypeAgentReply(value), /prototype response/);
+  value.references.push({
+    id: "ref-1",
+    kind: "region",
+    rect: { x: 10, y: 20, width: 30, height: 40 },
+    element: null,
+  });
+  const payload = buildThreadQuestionPayload({
+    sessionId: "lima",
+    thread: value,
+    question: "Why is this so tall?",
+    page: { title: "Demo" },
+    screenshotDataUrl: "data:image/png;base64,x",
+  });
+  assert.equal(payload.text, "Why is this so tall?");
+  assert.equal(payload.attachments.length, 1);
+  assert.match(payload.attachments[0].comment, /\[1A · Thread 1\]/);
+});
+
+test("scopes review conversation URLs to one encoded thread", () => {
+  assert.equal(
+    reviewThreadMessagesUrl("http://127.0.0.1:4317/lima", "thread 1"),
+    "http://127.0.0.1:4317/lima/review/threads/thread%201/messages",
+  );
+  assert.equal(
+    reviewThreadConversationUrl("http://127.0.0.1:4317/lima", "thread-1", 4),
+    "http://127.0.0.1:4317/lima/review/threads/thread-1/conversation?after=4",
+  );
+  assert.equal(
+    reviewDraftUrl("http://127.0.0.1:4317/lima"),
+    "http://127.0.0.1:4317/lima/review/draft",
+  );
 });
