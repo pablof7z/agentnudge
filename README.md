@@ -2,9 +2,9 @@
 
 AgentNudge is a tiny local chat bridge between a person looking at software and the coding agent working on it.
 
-A development-only message button opens a sidebar directly in the website. You can ask the agent a question or request a change, and attach page elements, rectangular regions, or freehand drawings to the message. AgentNudge can wake the current harness through a foreground wait, or route the conversation through a per-session Codex app-server whose replies appear directly in the sidebar.
+A development-only message button opens a sidebar directly in the website. You can ask the agent a question or request a change, and attach page elements, rectangular regions, or freehand drawings to the message. AgentNudge can wake the current harness through a foreground wait, or route the conversation through a per-session Codex or Claude runtime whose replies appear directly in the sidebar.
 
-The local/manual bridge needs no account, hosted service, browser extension, or multi-computer transport. Embedded Codex mode uses the machine's existing Codex installation and authentication.
+The local/manual bridge needs no account, hosted service, browser extension, or multi-computer transport. Embedded modes use the machine's existing Codex or Claude authentication.
 
 ## Agent skill
 
@@ -23,9 +23,24 @@ agentnudge session \
   --allow-browser-control
 ```
 
-The command prints the ready record, then remains in the foreground. Keep its process handle. Each browser message is sent to this session's private app-server thread; if Codex is already working, AgentNudge uses `turn/steer` to inject the message into that active turn. Completed Codex messages appear in the sidebar.
+Or use the official Claude ACP adapter (Node.js 22 or newer is required):
 
-The trusted `--context` (or `--context-file`) is applied at `thread/start`. Browser messages, captures, manifests, and page text stay untrusted user input. The annotated screenshot is supplied to Codex as a local image along with its evidence paths.
+```sh
+agentnudge session \
+  --origin http://localhost:5173 \
+  --runtime claude \
+  --workspace "$PWD" \
+  --context "Work on this preview and explain each completed change." \
+  --allow-browser-control
+```
+
+Claude mode launches the pinned `@agentclientprotocol/claude-agent-acp` package through `npx` and reuses the local Claude login. Pass `--runtime-bin /path/to/claude-agent-acp` to use an already-installed adapter instead.
+
+The command prints the ready record, then remains in the foreground. Keep its process handle. Each browser message is sent to the session's private runtime conversation. Codex uses `turn/steer` while active. Claude follows standard ACP and queues a new `session/prompt` until the current prompt completes. Completed agent messages appear in the sidebar.
+
+The trusted `--context` (or `--context-file`) is applied at Codex `thread/start` or appended to Claude Code's system prompt at ACP `session/new`. Browser messages, captures, manifests, and page text stay untrusted user input. The annotated screenshot is supplied as an image along with its evidence paths.
+
+Claude ACP tool permission requests are accepted for the current operation only, never persisted as always-allow rules. Unlike the Codex adapter's workspace sandbox, Claude ACP runs with the local Claude process's normal host authority. Start it only for a trusted local project and preview.
 
 Inspect the complete ordered conversation without consuming anything:
 
@@ -35,7 +50,7 @@ agentnudge transcript lima
 
 The sidebar X only hides chat. The adjacent end-session icon requires a confirming second click. It stops the runtime and releases the original foreground command with the final transcript and its durable `transcriptPath`. `agentnudge end-session lima` performs the same close from another agent terminal.
 
-The broker talks to embedded agents through a runtime command/event boundary. Codex JSON-RPC is isolated in its adapter so an ACP adapter can implement the same lifecycle later.
+The broker talks to embedded agents through one runtime command/event boundary. Codex app-server JSON-RPC and Claude ACP JSON-RPC remain isolated in their respective adapters.
 
 ## The manual agent loop
 
@@ -49,7 +64,7 @@ The command prints stable JSON, then remains in the foreground until the session
 
 ```json
 {
-  "version": 10,
+  "version": 11,
   "status": "ready",
   "session": "lima",
   "widgetUrl": "http://127.0.0.1:4317/lima/widget.js",
@@ -70,11 +85,11 @@ Sending a browser message completes the wait with JSON containing the message an
 
 ```json
 {
-  "version": 10,
+  "version": 11,
   "status": "message",
   "session": "lima",
   "message": {
-    "version": 10,
+    "version": 11,
     "sessionId": "lima",
     "messageId": "…",
     "sequence": 1,
@@ -125,7 +140,7 @@ agentnudge reply lima 0s \
 A wait without a message is a normal successful result:
 
 ```json
-{"version":10,"status":"timeout","session":"lima","waitedMs":600000}
+{"version":11,"status":"timeout","session":"lima","waitedMs":600000}
 ```
 
 Call `wait` again after a timeout. End the conversation explicitly when it is finished:
@@ -270,7 +285,7 @@ The generated `web/dist/widget.js` is checked in so installing the Rust binary d
 
 ## Scope
 
-This release remains local and web-first. Codex app-server is the first embedded-agent adapter; ACP, browser-wide CDP control, remote previews, phones, Nostr transport, native macOS/iOS adapters, raw page evaluation, console capture, network capture, storage capture, and full-DOM capture are deferred. Connected-page control deliberately stays inside the exact-origin development widget.
+This release remains local and web-first. Embedded chat supports Codex app-server and Claude ACP. Browser-wide CDP control, remote previews, phones, Nostr transport, native macOS/iOS adapters, raw page evaluation, console capture, network capture, storage capture, and full-DOM capture are deferred. Connected-page control deliberately stays inside the exact-origin development widget.
 
 ## License
 

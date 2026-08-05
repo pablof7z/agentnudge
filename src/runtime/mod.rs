@@ -1,3 +1,4 @@
+mod claude_acp;
 mod codex;
 
 use std::path::PathBuf;
@@ -15,12 +16,14 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeAdapterKind {
+    ClaudeAcp,
     Codex,
 }
 
 impl RuntimeAdapterKind {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::ClaudeAcp => "claude_acp",
             Self::Codex => "codex",
         }
     }
@@ -124,6 +127,9 @@ pub async fn start(
     };
 
     match config.adapter.clone() {
+        RuntimeAdapterKind::ClaudeAcp => {
+            claude_acp::start(config, command_receiver, event_sender, snapshot).await?;
+        }
         RuntimeAdapterKind::Codex => {
             codex::start(config, command_receiver, event_sender, snapshot).await?;
         }

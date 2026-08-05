@@ -78,9 +78,9 @@ enum Command {
         #[arg(long, default_value = ".")]
         workspace: PathBuf,
 
-        /// Alternate Codex executable, primarily for adapter testing.
-        #[arg(long, value_name = "PATH", requires = "runtime")]
-        codex_bin: Option<PathBuf>,
+        /// Alternate embedded-runtime executable, primarily for adapter testing.
+        #[arg(long, alias = "codex-bin", value_name = "PATH", requires = "runtime")]
+        runtime_bin: Option<PathBuf>,
     },
 
     /// Inspect and control a connected preview page through typed actions.
@@ -151,6 +151,8 @@ enum Command {
 
 #[derive(Clone, Debug, ValueEnum)]
 enum RuntimeArgument {
+    #[value(alias = "claude-acp")]
+    Claude,
     Codex,
 }
 
@@ -252,10 +254,10 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             context,
             context_file,
             workspace,
-            codex_bin,
+            runtime_bin,
         } => {
             let runtime =
-                build_runtime_config(runtime, context, context_file, workspace, codex_bin)?;
+                build_runtime_config(runtime, context, context_file, workspace, runtime_bin)?;
             let created = server::start_session(SessionConfig {
                 origin,
                 output,
@@ -394,7 +396,7 @@ fn build_runtime_config(
 ) -> anyhow::Result<Option<RuntimeLaunchConfig>> {
     let Some(runtime) = runtime else {
         if context.is_some() || context_file.is_some() || executable.is_some() {
-            bail!("--context, --context-file, and --codex-bin require --runtime codex");
+            bail!("--context, --context-file, and --runtime-bin require --runtime");
         }
         return Ok(None);
     };
@@ -415,12 +417,13 @@ fn build_runtime_config(
         bail!("runtime workspace {} is not a directory", cwd.display());
     }
     let adapter = match runtime {
+        RuntimeArgument::Claude => RuntimeAdapterKind::ClaudeAcp,
         RuntimeArgument::Codex => RuntimeAdapterKind::Codex,
     };
     let executable = executable
         .map(|path| {
             std::fs::canonicalize(&path)
-                .with_context(|| format!("could not resolve Codex executable {}", path.display()))
+                .with_context(|| format!("could not resolve runtime executable {}", path.display()))
         })
         .transpose()?;
     Ok(Some(RuntimeLaunchConfig {
@@ -567,6 +570,19 @@ mod tests {
                 "session",
                 "--runtime",
                 "codex",
+                "--context",
+                "Focus on the demo"
+            ])
+            .unwrap()
+            .command,
+            Command::Session { .. }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "agentnudge",
+                "session",
+                "--runtime",
+                "claude",
                 "--context",
                 "Focus on the demo"
             ])
