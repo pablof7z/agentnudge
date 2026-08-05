@@ -1,13 +1,24 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
+#[cfg(target_os = "macos")]
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
 const APPLE_STT_SOURCE: &str = include_str!("../native/macos/agentnudge-stt.swift");
+#[cfg(target_os = "macos")]
 const HELPER_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(target_os = "macos")]
 const BUILD_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MAX_AUDIO_BYTES: usize = 12 * 1024 * 1024;
 pub const MAX_LOCALE_CHARS: usize = 64;
@@ -184,6 +195,7 @@ async fn run_helper(helper: &Path, audio: &Path, locale: &str) -> Result<Transcr
         .context("the Apple speech helper returned an invalid response")
 }
 
+#[cfg(target_os = "macos")]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     std::fs::write(path, bytes)
         .with_context(|| format!("could not write temporary file {}", path.display()))?;
@@ -195,6 +207,7 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn source_fingerprint(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
         hash.wrapping_mul(0x100000001b3) ^ u64::from(*byte)
