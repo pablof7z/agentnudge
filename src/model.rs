@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-pub const PROTOCOL_VERSION: u8 = 11;
+pub const PROTOCOL_VERSION: u8 = 12;
 pub const MAX_MESSAGE_CHARS: usize = 10_000;
 pub const MAX_ATTACHMENTS: usize = 100;
 pub const MAX_DRAWING_STROKES: usize = 500;

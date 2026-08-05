@@ -8,11 +8,18 @@ import {
 } from "./browser-control.js";
 import { replyImageLabel, replyImageRequestUrl } from "./reply-images.js";
 import { endSessionRequestUrl } from "./session-lifecycle.js";
+import {
+  MAX_RECORDING_MS,
+  MicrophoneCapture,
+  insertTranscript,
+  transcriptionRequestUrl,
+} from "./audio-capture.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
 import iconDoorExit from "@tabler/icons/outline/door-exit.svg";
 import iconMessage from "@tabler/icons/outline/message-dots.svg";
+import iconMicrophone from "@tabler/icons/outline/microphone.svg";
 import iconPencil from "@tabler/icons/outline/pencil.svg";
 import iconPointer from "@tabler/icons/outline/pointer.svg";
 import iconRectangle from "@tabler/icons/outline/square-dashed.svg";
@@ -228,6 +235,8 @@ const css = String.raw`
   .composer-actions { min-height: 45px; display: flex; align-items: center; padding: 4px 5px 5px; }
   .tool-group { display: flex; align-items: center; gap: 1px; }
   .tool-group .icon-button { width: 32px; height: 32px; }
+  .dictate[data-active="true"] { background: var(--accent-soft); color: var(--accent); animation: dictation-pulse 1.4s ease-in-out infinite; }
+  @keyframes dictation-pulse { 50% { box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 16%, transparent); } }
   .send-button { width: 34px; height: 34px; margin-left: auto; display: grid; place-items: center; border: 0; border-radius: 10px; background: var(--accent); color: #fffaf6; cursor: pointer; transition: transform 120ms ease, opacity 120ms ease; }
   .send-button:hover { transform: translateY(-1px); }
   .send-button:active { transform: scale(.95); }
@@ -297,6 +306,11 @@ class AgentNudgeWidget extends HTMLElement {
     this.focusedMessageId = null;
     this.suppressNextClick = false;
     this.sending = false;
+    this.dictationState = "idle";
+    this.dictationAttempt = 0;
+    this.dictationAbort = null;
+    this.microphoneCapture = null;
+    this.recordingTimer = null;
     this.ending = false;
     this.sessionEnded = false;
     this.endArmed = false;
@@ -328,6 +342,7 @@ class AgentNudgeWidget extends HTMLElement {
                   ${iconButtonMarkup("attach-element", "Attach element", iconPointer)}
                   ${iconButtonMarkup("attach-region", "Attach region", iconRectangle)}
                   ${iconButtonMarkup("attach-drawing", "Attach drawing", iconPencil)}
+                  ${iconButtonMarkup("dictate", "Start voice dictation", iconMicrophone)}
                 </div>
                 <button class="send-button" type="button" aria-label="Send message" title="Send message">${iconSend}</button>
               </div>
@@ -360,6 +375,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.statusNode = this.shadowRoot.querySelector(".composer-status");
     this.connectionNode = this.shadowRoot.querySelector(".connection");
     this.sendButton = this.shadowRoot.querySelector(".send-button");
+    this.microphoneButton = this.shadowRoot.querySelector(".dictate");
     this.endSessionButton = this.shadowRoot.querySelector(".end-session");
     this.overlay = this.shadowRoot.querySelector(".overlay");
     this.captureModeNode = this.shadowRoot.querySelector(".capture-mode");
@@ -385,6 +401,7 @@ class AgentNudgeWidget extends HTMLElement {
       if (event.target === this.imageViewer) this.closeReplyImage();
     }, { signal });
     this.sendButton.addEventListener("click", () => this.send(), { signal });
+    this.microphoneButton.addEventListener("click", () => this.toggleDictation(), { signal });
     this.textarea.addEventListener("input", () => this.onTextInput(), { signal });
     this.textarea.addEventListener("keydown", (event) => this.onComposerKeyDown(event), { signal });
     document.addEventListener("pointerdown", (event) => this.onPointerDown(event), { capture: true, signal });
@@ -403,6 +420,7 @@ class AgentNudgeWidget extends HTMLElement {
   disconnectedCallback() {
     this.abort.abort();
     this.pollAbort.abort();
+    this.cancelDictation();
     for (const record of this.replyImageCache.values()) {
       if (record.url) URL.revokeObjectURL(record.url);
     }
@@ -418,6 +436,7 @@ class AgentNudgeWidget extends HTMLElement {
 
   close() {
     if (this.mode !== "idle") this.finishCapture();
+    this.cancelDictation();
     this.opened = false;
     this.focusedMessageId = null;
     this.renderAll();
@@ -440,6 +459,7 @@ class AgentNudgeWidget extends HTMLElement {
     }
 
     this.endArmed = false;
+    this.cancelDictation();
     if (this.endArmTimer) clearTimeout(this.endArmTimer);
     this.endArmTimer = null;
     this.ending = true;
@@ -470,7 +490,7 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   startCapture(mode) {
-    if (this.sending) return;
+    if (this.sending || this.dictationState !== "idle") return;
     this.opened = true;
     this.mode = mode;
     this.dragStart = null;
@@ -643,6 +663,111 @@ class AgentNudgeWidget extends HTMLElement {
   onTextInput() {
     autoSizeTextarea(this.textarea);
     this.updateSendButton();
+  }
+
+  async toggleDictation() {
+    if (this.sessionEnded || this.sending || this.mode !== "idle") return;
+    if (this.dictationState === "recording") {
+      await this.stopDictation();
+      return;
+    }
+    if (this.dictationState !== "idle") return;
+
+    this.dictationState = "starting";
+    const attempt = ++this.dictationAttempt;
+    this.setStatus("Requesting microphone access…");
+    this.renderShell();
+    try {
+      const capture = await MicrophoneCapture.start();
+      if (attempt !== this.dictationAttempt || this.sessionEnded || !this.isConnected) {
+        capture.cancel();
+        return;
+      }
+      this.microphoneCapture = capture;
+      this.dictationState = "recording";
+      this.setStatus("Listening… tap the microphone when you’re done.");
+      this.recordingTimer = setTimeout(() => this.stopDictation(), MAX_RECORDING_MS);
+    } catch (error) {
+      if (attempt !== this.dictationAttempt) return;
+      console.error("AgentNudge could not start dictation", error);
+      this.dictationState = "idle";
+      const denied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
+      this.setStatus(
+        denied ? "Microphone access was denied. Allow it for this page to dictate." : error.message || "Microphone recording is unavailable.",
+        true,
+      );
+    } finally {
+      if (attempt !== this.dictationAttempt) return;
+      this.renderShell();
+      this.updateSendButton();
+    }
+  }
+
+  async stopDictation() {
+    if (this.dictationState !== "recording" || !this.microphoneCapture) return;
+    if (this.recordingTimer) clearTimeout(this.recordingTimer);
+    this.recordingTimer = null;
+    this.dictationState = "transcribing";
+    const attempt = this.dictationAttempt;
+    const abort = new AbortController();
+    this.dictationAbort = abort;
+    this.setStatus("Transcribing locally…");
+    this.renderShell();
+    this.updateSendButton();
+    const capture = this.microphoneCapture;
+    this.microphoneCapture = null;
+    try {
+      const audio = await capture.stop();
+      const locale = navigator.language || "en-US";
+      const response = await fetch(transcriptionRequestUrl(ENDPOINT, locale), {
+        method: "POST",
+        mode: "cors",
+        cache: "no-store",
+        headers: {
+          "Content-Type": "audio/wav",
+          "X-AgentNudge-Token": BROWSER_TOKEN,
+        },
+        body: audio,
+        signal: abort.signal,
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
+      if (attempt !== this.dictationAttempt) return;
+      const inserted = insertTranscript(
+        this.textarea.value,
+        this.textarea.selectionStart ?? this.textarea.value.length,
+        this.textarea.selectionEnd ?? this.textarea.value.length,
+        result.text || "",
+      );
+      this.textarea.value = inserted.value;
+      this.textarea.setSelectionRange(inserted.cursor, inserted.cursor);
+      this.onTextInput();
+      this.setStatus(`Transcribed locally (${result.locale || locale}).`);
+      queueMicrotask(() => this.textarea.focus());
+    } catch (error) {
+      if (abort.signal.aborted || attempt !== this.dictationAttempt) return;
+      console.error("AgentNudge dictation failed", error);
+      this.setStatus(error.message || "Voice dictation failed.", true);
+    } finally {
+      if (this.dictationAbort === abort) this.dictationAbort = null;
+      if (attempt !== this.dictationAttempt) return;
+      this.dictationState = "idle";
+      this.renderShell();
+      this.updateSendButton();
+    }
+  }
+
+  cancelDictation() {
+    const wasActive = this.dictationState !== "idle";
+    this.dictationAttempt += 1;
+    this.dictationAbort?.abort();
+    this.dictationAbort = null;
+    if (this.recordingTimer) clearTimeout(this.recordingTimer);
+    this.recordingTimer = null;
+    this.microphoneCapture?.cancel();
+    this.microphoneCapture = null;
+    this.dictationState = "idle";
+    if (wasActive) this.setStatus("");
   }
 
   addAttachment(value) {
@@ -937,8 +1062,14 @@ class AgentNudgeWidget extends HTMLElement {
     this.shell.dataset.open = String(this.opened);
     this.shell.dataset.capturing = String(this.mode !== "idle");
     for (const mode of ["element", "region", "drawing"]) {
-      this.shadowRoot.querySelector(`.attach-${mode}`).dataset.active = String(this.mode === mode);
+      const button = this.shadowRoot.querySelector(`.attach-${mode}`);
+      button.dataset.active = String(this.mode === mode);
+      button.disabled = this.sessionEnded || this.sending || this.dictationState !== "idle";
     }
+    this.microphoneButton.dataset.active = String(this.dictationState === "recording");
+    this.microphoneButton.disabled = this.sessionEnded || this.sending || this.mode !== "idle" || ["starting", "transcribing"].includes(this.dictationState);
+    this.microphoneButton.title = this.dictationState === "recording" ? "Stop and transcribe" : "Start voice dictation";
+    this.microphoneButton.ariaLabel = this.microphoneButton.title;
     this.shadowRoot.querySelector(".capture-undo").disabled = this.undoStack.length === 0;
     this.shadowRoot.querySelector(".capture-redo").disabled = this.redoStack.length === 0;
     this.endSessionButton.disabled = this.ending || this.sessionEnded;
@@ -1137,7 +1268,7 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   updateSendButton() {
-    this.sendButton.disabled = this.sending || this.sessionEnded || (!this.textarea.value.trim() && this.draftAttachments.length === 0);
+    this.sendButton.disabled = this.sending || this.sessionEnded || this.dictationState !== "idle" || (!this.textarea.value.trim() && this.draftAttachments.length === 0);
   }
 
   setStatus(message, error = false) {

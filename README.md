@@ -64,7 +64,7 @@ The command prints stable JSON, then remains in the foreground until the session
 
 ```json
 {
-  "version": 11,
+  "version": 12,
   "status": "ready",
   "session": "lima",
   "widgetUrl": "http://127.0.0.1:4317/lima/widget.js",
@@ -85,11 +85,11 @@ Sending a browser message completes the wait with JSON containing the message an
 
 ```json
 {
-  "version": 11,
+  "version": 12,
   "status": "message",
   "session": "lima",
   "message": {
-    "version": 11,
+    "version": 12,
     "sessionId": "lima",
     "messageId": "…",
     "sequence": 1,
@@ -140,7 +140,7 @@ agentnudge reply lima 0s \
 A wait without a message is a normal successful result:
 
 ```json
-{"version":11,"status":"timeout","session":"lima","waitedMs":600000}
+{"version":12,"status":"timeout","session":"lima","waitedMs":600000}
 ```
 
 Call `wait` again after a timeout. End the conversation explicitly when it is finished:
@@ -150,6 +150,14 @@ agentnudge end-session lima
 ```
 
 The original `session` process then exits with the complete final transcript.
+
+## Voice dictation on macOS
+
+On macOS 26 or later, the composer microphone records up to 60 seconds and transcribes it with Apple's on-device `SpeechTranscriber`. Press the microphone once to start, press it again to stop, then review or edit the inserted text before sending. Dictation never sends a message automatically.
+
+The browser captures mono PCM WAV. The broker accepts only a bounded WAV body from that session's exact origin and browser capability, writes it to a private runtime file, invokes the fixed Apple Speech helper, and deletes the recording immediately afterward. Apple manages the language model; the first transcription for a locale can take longer while its asset is installed.
+
+The helper is compiled and cached on first use, so dictation currently requires `xcrun swiftc` from Xcode or the Xcode command-line developer environment. Other operating systems return an explicit unsupported-platform error; a pluggable Parakeet or Whisper backend can be added later without changing the browser capture flow.
 
 ## Run code
 
@@ -205,7 +213,7 @@ The short word is a routing handle, not a secret. The broker keeps its agent cap
 
 ## Try the local demo
 
-Requirements: Rust, Node.js, and Python 3.
+Requirements: Rust, Node.js, and Python 3. Voice dictation additionally requires macOS 26 or later and `xcrun swiftc`.
 
 ```sh
 git clone https://github.com/pablof7z/agentnudge.git

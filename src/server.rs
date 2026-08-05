@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
@@ -41,6 +41,7 @@ use crate::model::{
 use crate::runtime::{
     RuntimeEvent, RuntimeHandle, RuntimeLaunchConfig, RuntimeSnapshot, RuntimeUserMessage,
 };
+use crate::stt;
 
 const WIDGET_SOURCE: &str = include_str!("../web/dist/widget.js");
 const MAX_REQUEST_BYTES: usize = 15 * 1024 * 1024;
@@ -173,6 +174,16 @@ struct BrowserCommandQuery {
     page_id: String,
     url: String,
     title: String,
+}
+
+#[derive(Deserialize)]
+struct TranscriptionQuery {
+    #[serde(default = "default_transcription_locale")]
+    locale: String,
+}
+
+fn default_transcription_locale() -> String {
+    "en-US".into()
 }
 
 #[derive(Default)]
@@ -547,6 +558,10 @@ fn broker_router(state: BrokerState) -> Router {
         .route(
             "/{session_id}/conversation",
             get(conversation).options(browser_preflight),
+        )
+        .route(
+            "/{session_id}/transcribe",
+            post(transcribe_audio).options(browser_preflight),
         )
         .route(
             "/{session_id}/session",
@@ -1388,6 +1403,79 @@ async fn reply_asset(
         .headers_mut()
         .insert(VARY, HeaderValue::from_static("Origin, X-AgentNudge-Token"));
     response
+}
+
+async fn transcribe_audio(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Query(query): Query<TranscriptionQuery>,
+    audio: Bytes,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    if session.ended.load(Ordering::SeqCst) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::GONE,
+            json!({"error": "session_ended"}),
+        );
+    }
+    let media_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim);
+    if !matches!(media_type, Some("audio/wav" | "audio/x-wav")) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            json!({
+                "error": "unsupported_audio_type",
+                "message": "speech transcription accepts WAV audio"
+            }),
+        );
+    }
+    if let Err(error) = stt::validate_wav(&audio).and_then(|_| stt::validate_locale(&query.locale))
+    {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "invalid_audio", "message": error.to_string()}),
+        );
+    }
+    let runtime = match runtime_directory() {
+        Ok(path) => path,
+        Err(error) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "transcription_unavailable", "message": error.to_string()}),
+            );
+        }
+    };
+    match stt::transcribe_wav(&audio, &query.locale, &runtime).await {
+        Ok(transcription) => cors_json(
+            &session.allowed_origin,
+            StatusCode::OK,
+            &json!({
+                "version": PROTOCOL_VERSION,
+                "status": "transcribed",
+                "text": transcription.text,
+                "locale": transcription.locale,
+                "engine": transcription.engine,
+            }),
+        ),
+        Err(error) => json_response(
+            &session.allowed_origin,
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"error": "transcription_failed", "message": error.to_string()}),
+        ),
+    }
 }
 
 async fn browser_commands(
@@ -3090,6 +3178,64 @@ mod tests {
         assert!(script.contains(&session.endpoint));
         assert!(script.contains(&session.browser_token));
         assert!(!script.contains(&broker.agent_token));
+    }
+
+    #[tokio::test]
+    async fn transcription_rejects_invalid_audio_before_launching_a_helper() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        let mut headers = browser_headers(&session);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+        let response = transcribe_audio(
+            AxumPath(created.session),
+            State(broker),
+            headers,
+            Query(TranscriptionQuery {
+                locale: "en-US".into(),
+            }),
+            Bytes::from_static(b"not a WAV file"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let value: serde_json::Value = response_json(response).await;
+        assert_eq!(value["error"], "invalid_audio");
+    }
+
+    #[tokio::test]
+    async fn transcription_requires_the_session_browser_capability() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("http://localhost:5173"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+        let response = transcribe_audio(
+            AxumPath(created.session),
+            State(broker),
+            headers,
+            Query(TranscriptionQuery {
+                locale: "en-US".into(),
+            }),
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
