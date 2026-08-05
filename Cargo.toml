@@ -9,6 +9,7 @@ readme = "README.md"
 keywords = ["agent", "feedback", "ui", "annotation", "cli"]
 categories = ["command-line-utilities", "development-tools"]
 include = [
+    "/native/**",
     "/src/**",
     "/skills/**",
     "/web/dist/widget.js",

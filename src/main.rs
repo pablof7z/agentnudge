@@ -2,6 +2,7 @@ mod execution;
 mod model;
 mod runtime;
 mod server;
+mod stt;
 
 use std::ffi::OsString;
 use std::io::Write as _;
