@@ -1,0 +1,4 @@
+interface:
+  display_name: "AgentNudge"
+  short_description: "Run feedback, code, and preview-control loops"
+  default_prompt: "Use $agentnudge to connect this local website to the agent, operate the preview when needed, and wait for my feedback."

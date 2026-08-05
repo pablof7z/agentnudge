@@ -24,22 +24,32 @@ use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, Notify, oneshot};
 use tokio::time::Instant;
 use url::Url;
 use uuid::Uuid;
 
 use crate::model::{
-    AgentReplyImageUpload, AgentReplySubmission, ChatMessage, ChatRole, ChatSubmission,
-    ConversationResponse, InboundMessage, MAX_REPLY_IMAGE_ATTACHMENTS, MAX_REPLY_IMAGE_BYTES,
-    MAX_REPLY_IMAGE_TOTAL_BYTES, MAX_SCREENSHOT_BYTES, MessageManifest, MessageReceipt,
-    PROTOCOL_VERSION, ReplyImageAttachment, ReplyReceipt, TrustBoundary,
+    AgentReplyImageUpload, AgentReplySubmission, BrowserAction, BrowserActionRequest,
+    BrowserActionResponse, BrowserCommand, BrowserCommandPollResponse,
+    BrowserCommandResultSubmission, BrowserPage, BrowserPagesResponse, ChatMessage, ChatRole,
+    ChatSubmission, ConversationResponse, InboundMessage, MAX_BROWSER_FILL_CHARS,
+    MAX_BROWSER_RESULT_BYTES, MAX_BROWSER_SELECTOR_CHARS, MAX_REPLY_IMAGE_ATTACHMENTS,
+    MAX_REPLY_IMAGE_BYTES, MAX_REPLY_IMAGE_TOTAL_BYTES, MAX_SCREENSHOT_BYTES, MessageManifest,
+    MessageReceipt, PROTOCOL_VERSION, ReplyImageAttachment, ReplyReceipt, TrustBoundary,
+};
+use crate::runtime::{
+    RuntimeEvent, RuntimeHandle, RuntimeLaunchConfig, RuntimeSnapshot, RuntimeUserMessage,
 };
 
 const WIDGET_SOURCE: &str = include_str!("../web/dist/widget.js");
 const MAX_REQUEST_BYTES: usize = 15 * 1024 * 1024;
 const DEFAULT_BROKER_PORT: u16 = 4317;
 const MAX_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+const BROWSER_PAGE_STALE_AFTER: Duration = Duration::from_secs(45);
+const BROWSER_COMMAND_POLL: Duration = Duration::from_secs(20);
+const COMPLETION_POLL: Duration = Duration::from_secs(20);
+const MAX_RUNTIME_CONTEXT_CHARS: usize = 100_000;
 const NATO_WORDS: [&str; 26] = [
     "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett",
     "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo", "sierra", "tango",
@@ -50,6 +60,8 @@ const NATO_WORDS: [&str; 26] = [
 pub struct SessionConfig {
     pub origin: Url,
     pub output: PathBuf,
+    pub allow_browser_control: bool,
+    pub runtime: Option<RuntimeLaunchConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +78,9 @@ pub struct SessionCreated {
     pub session: String,
     pub widget_url: String,
     pub script_tag: String,
+    pub browser_control_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSnapshot>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -86,6 +101,40 @@ pub struct EndSessionReceipt {
     pub version: u8,
     pub status: String,
     pub session: String,
+    pub transcript: SessionTranscript,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserEndSessionReceipt {
+    version: u8,
+    status: String,
+    session: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTranscript {
+    pub version: u8,
+    pub status: String,
+    pub session: String,
+    pub started_at_unix_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeSnapshot>,
+    pub messages: Vec<ChatMessage>,
+    pub transcript_path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionCompletionResponse {
+    version: u8,
+    status: String,
+    session: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript: Option<SessionTranscript>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -102,6 +151,10 @@ struct BrokerDescriptor {
 struct CreateSessionRequest {
     origin: String,
     output_directory: String,
+    #[serde(default)]
+    allow_browser_control: bool,
+    #[serde(default)]
+    runtime: Option<RuntimeLaunchConfig>,
 }
 
 #[derive(Deserialize)]
@@ -113,6 +166,13 @@ struct ConversationQuery {
 #[derive(Deserialize)]
 struct WaitQuery {
     timeout_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct BrowserCommandQuery {
+    page_id: String,
+    url: String,
+    title: String,
 }
 
 #[derive(Default)]
@@ -129,11 +189,39 @@ struct SessionState {
     session_id: String,
     browser_token: String,
     output: PathBuf,
+    transcript_path: PathBuf,
+    started_at_unix_ms: u128,
     conversation: Arc<Mutex<Conversation>>,
     reply_assets: Arc<Mutex<HashMap<String, StoredReplyAsset>>>,
     inbound_notify: Arc<Notify>,
     transcript_notify: Arc<Notify>,
+    browser_control_enabled: bool,
+    browser_control: Arc<Mutex<BrowserControlState>>,
+    browser_command_notify: Arc<Notify>,
+    runtime: Arc<Mutex<Option<RuntimeHandle>>>,
+    completion_notify: Arc<Notify>,
     ended: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct BrowserControlState {
+    pages: HashMap<String, BrowserPage>,
+    commands: VecDeque<BrowserCommand>,
+    pending: HashMap<String, PendingBrowserCommand>,
+}
+
+struct PendingBrowserCommand {
+    page_id: String,
+    expires_at_unix_ms: u64,
+    result_policy: BrowserResultPolicy,
+    sender: oneshot::Sender<BrowserCommandResultSubmission>,
+}
+
+#[derive(Clone)]
+enum BrowserResultPolicy {
+    Standard,
+    Fill { characters: usize },
+    Screenshot,
 }
 
 #[derive(Clone)]
@@ -164,6 +252,7 @@ struct BrokerState {
     endpoint: String,
     agent_token: String,
     sessions: Arc<Mutex<HashMap<String, SessionState>>>,
+    completed_sessions: Arc<Mutex<HashMap<String, SessionTranscript>>>,
 }
 
 impl BrokerState {
@@ -172,6 +261,7 @@ impl BrokerState {
             endpoint,
             agent_token,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            completed_sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -182,6 +272,8 @@ pub async fn start_session(config: SessionConfig) -> Result<SessionCreated> {
     let request = CreateSessionRequest {
         origin: origin_string(&config.origin)?,
         output_directory: output.display().to_string(),
+        allow_browser_control: config.allow_browser_control,
+        runtime: config.runtime,
     };
     let response = agent_client(Duration::from_secs(10))?
         .post(format!("{}/agent/sessions", descriptor.endpoint))
@@ -198,6 +290,48 @@ pub async fn wait_for_message(session: &str, duration: Duration) -> Result<WaitR
     let session = validate_session_id(session)?;
     let descriptor = live_broker().await?;
     wait_with_descriptor(&descriptor, &session, duration).await
+}
+
+pub async fn list_browser_pages(session: &str) -> Result<BrowserPagesResponse> {
+    let session = validate_session_id(session)?;
+    let descriptor = live_broker().await?;
+    let response = agent_client(Duration::from_secs(10))?
+        .get(format!(
+            "{}/agent/sessions/{session}/browser/pages",
+            descriptor.endpoint
+        ))
+        .header("x-agentnudge-agent-token", &descriptor.agent_token)
+        .send()
+        .await
+        .context("could not list connected AgentNudge pages")?;
+    parse_response(response).await
+}
+
+pub async fn run_browser_action(
+    session: &str,
+    page_id: Option<String>,
+    duration: Duration,
+    action: BrowserAction,
+) -> Result<BrowserActionResponse> {
+    validate_wait(duration)?;
+    if duration.is_zero() {
+        bail!("browser actions need a duration greater than zero");
+    }
+    let session = validate_session_id(session)?;
+    let descriptor = live_broker().await?;
+    let timeout_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    let response = agent_client(duration.saturating_add(Duration::from_secs(10)))?
+        .post(format!(
+            "{}/agent/sessions/{session}/browser/actions",
+            descriptor.endpoint
+        ))
+        .query(&[("timeout_ms", timeout_ms)])
+        .header("x-agentnudge-agent-token", &descriptor.agent_token)
+        .json(&BrowserActionRequest { page_id, action })
+        .send()
+        .await
+        .context("could not run the AgentNudge browser action")?;
+    parse_response(response).await
 }
 
 pub async fn reply_and_wait(
@@ -312,6 +446,44 @@ pub async fn end_session(session: &str) -> Result<EndSessionReceipt> {
     parse_response(response).await
 }
 
+pub async fn session_transcript(session: &str) -> Result<SessionTranscript> {
+    let session = validate_session_id(session)?;
+    let descriptor = live_broker().await?;
+    let response = agent_client(Duration::from_secs(10))?
+        .get(format!(
+            "{}/agent/sessions/{session}/transcript",
+            descriptor.endpoint
+        ))
+        .header("x-agentnudge-agent-token", &descriptor.agent_token)
+        .send()
+        .await
+        .context("could not read the AgentNudge transcript")?;
+    parse_response(response).await
+}
+
+pub async fn wait_for_session_end(session: &str) -> Result<SessionTranscript> {
+    let session = validate_session_id(session)?;
+    loop {
+        let descriptor = live_broker().await?;
+        let response = agent_client(COMPLETION_POLL.saturating_add(Duration::from_secs(10)))?
+            .get(format!(
+                "{}/agent/sessions/{session}/completion",
+                descriptor.endpoint
+            ))
+            .query(&[("timeout_ms", COMPLETION_POLL.as_millis() as u64)])
+            .header("x-agentnudge-agent-token", &descriptor.agent_token)
+            .send()
+            .await
+            .context("could not wait for the AgentNudge session to end")?;
+        let completion: SessionCompletionResponse = parse_response(response).await?;
+        if completion.status == "ended" {
+            return completion
+                .transcript
+                .context("the ended AgentNudge session returned no transcript");
+        }
+    }
+}
+
 pub async fn run_broker(config: BrokerConfig) -> Result<()> {
     let descriptor_file = absolute_path(&config.descriptor_file)?;
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, config.port))
@@ -350,7 +522,23 @@ fn broker_router(state: BrokerState) -> Router {
         .route("/agent/sessions", post(create_session))
         .route("/agent/sessions/{session_id}", delete(delete_session))
         .route("/agent/sessions/{session_id}/wait", get(agent_wait))
+        .route(
+            "/agent/sessions/{session_id}/transcript",
+            get(agent_transcript),
+        )
+        .route(
+            "/agent/sessions/{session_id}/completion",
+            get(agent_completion),
+        )
         .route("/agent/sessions/{session_id}/reply", post(agent_reply))
+        .route(
+            "/agent/sessions/{session_id}/browser/pages",
+            get(agent_browser_pages),
+        )
+        .route(
+            "/agent/sessions/{session_id}/browser/actions",
+            post(agent_browser_action),
+        )
         .route("/{session_id}/widget.js", get(widget))
         .route(
             "/{session_id}/messages",
@@ -359,6 +547,18 @@ fn broker_router(state: BrokerState) -> Router {
         .route(
             "/{session_id}/conversation",
             get(conversation).options(browser_preflight),
+        )
+        .route(
+            "/{session_id}/session",
+            delete(browser_end_session).options(browser_preflight),
+        )
+        .route(
+            "/{session_id}/browser/commands",
+            get(browser_commands).options(browser_preflight),
+        )
+        .route(
+            "/{session_id}/browser/commands/{command_id}",
+            post(browser_command_result).options(browser_command_result_preflight),
         )
         .route(
             "/{session_id}/reply-assets/{attachment_id}",
@@ -417,7 +617,25 @@ async fn create_session(
             .into_response();
     }
 
-    match register_session(&state, origin, output).await {
+    if let Some(runtime) = request.runtime.as_ref()
+        && let Err(error) = validate_runtime_config(runtime)
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "invalid_runtime", "message": error.to_string()})),
+        )
+            .into_response();
+    }
+
+    match register_session_with_runtime(
+        &state,
+        origin,
+        output,
+        request.allow_browser_control,
+        request.runtime,
+    )
+    .await
+    {
         Ok(created) => (StatusCode::CREATED, Json(created)).into_response(),
         Err(error) => (
             StatusCode::CONFLICT,
@@ -427,36 +645,102 @@ async fn create_session(
     }
 }
 
+#[cfg(test)]
 async fn register_session(
     broker: &BrokerState,
     allowed_origin: String,
     output_root: PathBuf,
+    browser_control_enabled: bool,
 ) -> Result<SessionCreated> {
-    let mut sessions = broker.sessions.lock().await;
-    let session_id = allocate_session_id(&sessions)?;
+    register_session_with_runtime(
+        broker,
+        allowed_origin,
+        output_root,
+        browser_control_enabled,
+        None,
+    )
+    .await
+}
+
+async fn register_session_with_runtime(
+    broker: &BrokerState,
+    allowed_origin: String,
+    output_root: PathBuf,
+    browser_control_enabled: bool,
+    runtime_config: Option<RuntimeLaunchConfig>,
+) -> Result<SessionCreated> {
+    let session_id = {
+        let sessions = broker.sessions.lock().await;
+        allocate_session_id(&sessions)?
+    };
     let endpoint = format!("{}/{}", broker.endpoint, session_id);
     let widget_url = format!("{endpoint}/widget.js");
-    sessions.insert(
-        session_id.clone(),
-        SessionState {
-            allowed_origin,
-            endpoint,
-            session_id: session_id.clone(),
-            browser_token: capability_token(),
-            output: output_root.join(&session_id),
-            conversation: Arc::new(Mutex::new(Conversation::default())),
-            reply_assets: Arc::new(Mutex::new(HashMap::new())),
-            inbound_notify: Arc::new(Notify::new()),
-            transcript_notify: Arc::new(Notify::new()),
-            ended: Arc::new(AtomicBool::new(false)),
-        },
-    );
+    let output = output_root.join(&session_id);
+    let session = SessionState {
+        allowed_origin,
+        endpoint,
+        session_id: session_id.clone(),
+        browser_token: capability_token(),
+        transcript_path: output.join("transcript.json"),
+        output,
+        started_at_unix_ms: unix_time_ms()?,
+        conversation: Arc::new(Mutex::new(Conversation::default())),
+        reply_assets: Arc::new(Mutex::new(HashMap::new())),
+        inbound_notify: Arc::new(Notify::new()),
+        transcript_notify: Arc::new(Notify::new()),
+        browser_control_enabled,
+        browser_control: Arc::new(Mutex::new(BrowserControlState::default())),
+        browser_command_notify: Arc::new(Notify::new()),
+        runtime: Arc::new(Mutex::new(None)),
+        completion_notify: Arc::new(Notify::new()),
+        ended: Arc::new(AtomicBool::new(false)),
+    };
+    {
+        let mut sessions = broker.sessions.lock().await;
+        if sessions.contains_key(&session_id) {
+            bail!("the selected AgentNudge session word became unavailable; retry");
+        }
+        sessions.insert(session_id.clone(), session.clone());
+    }
+    broker.completed_sessions.lock().await.remove(&session_id);
+
+    let runtime = if let Some(mut config) = runtime_config {
+        let executable = std::env::current_exe()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "agentnudge".into());
+        config.context = format!(
+            "AgentNudge session handle: {session_id}. AgentNudge CLI: {executable}. If this session allows browser control, use `agentnudge browser {session_id} ...` (or the absolute CLI path above) to inspect, change, and reload the connected page.\n\n{}",
+            config.context
+        );
+        match crate::runtime::start(config).await {
+            Ok((handle, events)) => {
+                *session.runtime.lock().await = Some(handle.clone());
+                spawn_runtime_event_listener(session.clone(), events);
+                Some(handle.snapshot().await)
+            }
+            Err(error) => {
+                broker.sessions.lock().await.remove(&session_id);
+                return Err(error.context("could not start the embedded agent runtime"));
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(error) = persist_active_transcript(&session).await {
+        if let Some(runtime) = session.runtime.lock().await.clone() {
+            let _ = runtime.shutdown().await;
+        }
+        broker.sessions.lock().await.remove(&session_id);
+        return Err(error.context("could not initialize the session transcript"));
+    }
     Ok(SessionCreated {
         version: PROTOCOL_VERSION,
         status: "ready".into(),
         session: session_id,
         script_tag: format!("<script type=\"module\" src=\"{widget_url}\"></script>"),
         widget_url,
+        browser_control_enabled,
+        runtime,
     })
 }
 
@@ -472,19 +756,86 @@ async fn delete_session(
         Ok(value) => value,
         Err(error) => return agent_bad_request(error.to_string()),
     };
-    let removed = state.sessions.lock().await.remove(&session_id);
-    let Some(session) = removed else {
+    match finish_session(&state, &session_id).await {
+        Ok(transcript) => (
+            StatusCode::OK,
+            Json(EndSessionReceipt {
+                version: PROTOCOL_VERSION,
+                status: "ended".into(),
+                session: session_id,
+                transcript,
+            }),
+        )
+            .into_response(),
+        Err(error) => agent_bad_request(error.to_string()),
+    }
+}
+
+async fn agent_transcript(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !valid_agent_token(&state, &headers) {
+        return agent_unauthorized();
+    }
+    match current_transcript(&state, &session_id).await {
+        Some(transcript) => (StatusCode::OK, Json(transcript)).into_response(),
+        None => agent_not_found(&session_id),
+    }
+}
+
+async fn agent_completion(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Query(query): Query<WaitQuery>,
+) -> Response<Body> {
+    if !valid_agent_token(&state, &headers) {
+        return agent_unauthorized();
+    }
+    let duration = Duration::from_millis(query.timeout_ms).min(COMPLETION_POLL);
+    if let Some(transcript) = state
+        .completed_sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    {
+        return completion_response(&session_id, "ended", Some(transcript));
+    }
+    let Some(session) = find_session(&state, &session_id).await else {
         return agent_not_found(&session_id);
     };
-    session.ended.store(true, Ordering::Release);
-    session.inbound_notify.notify_waiters();
-    session.transcript_notify.notify_waiters();
+    let notified = session.completion_notify.notified();
+    if !session.ended.load(Ordering::Acquire) {
+        let _ = tokio::time::timeout(duration, notified).await;
+    }
+    if let Some(transcript) = state
+        .completed_sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    {
+        completion_response(&session_id, "ended", Some(transcript))
+    } else {
+        completion_response(&session_id, "active", None)
+    }
+}
+
+fn completion_response(
+    session_id: &str,
+    status: &str,
+    transcript: Option<SessionTranscript>,
+) -> Response<Body> {
     (
         StatusCode::OK,
-        Json(EndSessionReceipt {
+        Json(SessionCompletionResponse {
             version: PROTOCOL_VERSION,
-            status: "ended".into(),
-            session: session_id,
+            status: status.into(),
+            session: session_id.into(),
+            transcript,
         }),
     )
         .into_response()
@@ -545,6 +896,167 @@ async fn agent_reply(
     }
 }
 
+async fn agent_browser_pages(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    if !valid_agent_token(&state, &headers) {
+        return agent_unauthorized();
+    }
+    let Some(session) = find_session(&state, &session_id).await else {
+        return agent_not_found(&session_id);
+    };
+    if !session.browser_control_enabled {
+        return browser_control_disabled();
+    }
+    let now = match unix_time_ms_u64() {
+        Ok(value) => value,
+        Err(error) => return agent_bad_request(error.to_string()),
+    };
+    let mut browser = session.browser_control.lock().await;
+    prune_stale_browser_pages(&mut browser, now);
+    let mut pages: Vec<_> = browser.pages.values().cloned().collect();
+    pages.sort_by(|first, second| first.page_id.cmp(&second.page_id));
+    (
+        StatusCode::OK,
+        Json(BrowserPagesResponse {
+            version: PROTOCOL_VERSION,
+            status: "ready".into(),
+            session: session.session_id,
+            pages,
+            trust: TrustBoundary::untrusted_page(),
+        }),
+    )
+        .into_response()
+}
+
+async fn agent_browser_action(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Query(query): Query<WaitQuery>,
+    Json(mut request): Json<BrowserActionRequest>,
+) -> Response<Body> {
+    if !valid_agent_token(&state, &headers) {
+        return agent_unauthorized();
+    }
+    let duration = Duration::from_millis(query.timeout_ms);
+    if duration.is_zero() {
+        return agent_bad_request("browser actions need a duration greater than zero".into());
+    }
+    if let Err(error) = validate_wait(duration) {
+        return agent_bad_request(error.to_string());
+    }
+    let Some(session) = find_session(&state, &session_id).await else {
+        return agent_not_found(&session_id);
+    };
+    if !session.browser_control_enabled {
+        return browser_control_disabled();
+    }
+    if let Err(error) = validate_browser_action(&mut request.action, &session.allowed_origin) {
+        return agent_bad_request(error.to_string());
+    }
+    let now = match unix_time_ms_u64() {
+        Ok(value) => value,
+        Err(error) => return agent_bad_request(error.to_string()),
+    };
+    let started = Instant::now();
+    let command_id = Uuid::new_v4().to_string();
+    let (sender, receiver) = oneshot::channel();
+    let result_policy = browser_result_policy(&request.action);
+    let page_id = {
+        let mut browser = session.browser_control.lock().await;
+        prune_stale_browser_pages(&mut browser, now);
+        let page_id = match select_browser_page(&browser, request.page_id.as_deref()) {
+            Ok(value) => value,
+            Err(error) => return agent_bad_request(error.to_string()),
+        };
+        let expires_at_unix_ms = now.saturating_add(query.timeout_ms);
+        browser.commands.push_back(BrowserCommand {
+            version: PROTOCOL_VERSION,
+            command_id: command_id.clone(),
+            session: session.session_id.clone(),
+            page_id: page_id.clone(),
+            expires_at_unix_ms,
+            action: request.action,
+        });
+        browser.pending.insert(
+            command_id.clone(),
+            PendingBrowserCommand {
+                page_id: page_id.clone(),
+                expires_at_unix_ms,
+                result_policy,
+                sender,
+            },
+        );
+        page_id
+    };
+    session.browser_command_notify.notify_waiters();
+
+    match tokio::time::timeout(duration, receiver).await {
+        Ok(Ok(result)) => (
+            StatusCode::OK,
+            Json(BrowserActionResponse {
+                version: PROTOCOL_VERSION,
+                status: result.status,
+                session: session.session_id,
+                command_id: Some(command_id),
+                page_id: Some(page_id),
+                value: result.value,
+                error: result.error,
+                current_url: Some(result.current_url),
+                title: Some(result.title),
+                waited_ms: elapsed_ms(started.elapsed()),
+                trust: TrustBoundary::untrusted_page(),
+            }),
+        )
+            .into_response(),
+        Ok(Err(_)) => (
+            StatusCode::OK,
+            Json(BrowserActionResponse {
+                version: PROTOCOL_VERSION,
+                status: "ended".into(),
+                session: session.session_id,
+                command_id: Some(command_id),
+                page_id: Some(page_id),
+                value: None,
+                error: Some("the AgentNudge session ended before the action completed".into()),
+                current_url: None,
+                title: None,
+                waited_ms: elapsed_ms(started.elapsed()),
+                trust: TrustBoundary::untrusted_page(),
+            }),
+        )
+            .into_response(),
+        Err(_) => {
+            let mut browser = session.browser_control.lock().await;
+            browser.pending.remove(&command_id);
+            browser
+                .commands
+                .retain(|command| command.command_id != command_id);
+            drop(browser);
+            (
+                StatusCode::OK,
+                Json(BrowserActionResponse {
+                    version: PROTOCOL_VERSION,
+                    status: "timeout".into(),
+                    session: session.session_id,
+                    command_id: Some(command_id),
+                    page_id: Some(page_id),
+                    value: None,
+                    error: None,
+                    current_url: None,
+                    title: None,
+                    waited_ms: elapsed_ms(started.elapsed()),
+                    trust: TrustBoundary::untrusted_page(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn record_agent_reply(
     state: &SessionState,
     submission: PreparedAgentReply,
@@ -570,6 +1082,7 @@ async fn record_agent_reply(
         sequence
     };
     state.transcript_notify.notify_waiters();
+    persist_active_transcript(state).await?;
     Ok(ReplyReceipt {
         version: PROTOCOL_VERSION,
         status: "accepted".into(),
@@ -739,7 +1252,15 @@ async fn widget(
         .replace("__AGENTNUDGE_ENDPOINT__", &session.endpoint)
         .replace("__AGENTNUDGE_ORIGIN__", &session.allowed_origin)
         .replace("__AGENTNUDGE_SESSION__", &session.session_id)
-        .replace("__AGENTNUDGE_BROWSER_TOKEN__", &session.browser_token);
+        .replace("__AGENTNUDGE_BROWSER_TOKEN__", &session.browser_token)
+        .replace(
+            "__AGENTNUDGE_BROWSER_CONTROL__",
+            if session.browser_control_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        );
     let mut response = Response::new(Body::from(script));
     response.headers_mut().insert(
         CONTENT_TYPE,
@@ -775,6 +1296,27 @@ async fn browser_preflight(
 
 async fn reply_asset_preflight(
     AxumPath((session_id, _attachment_id)): AxumPath<(String, String)>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if !valid_origin(&headers, &session.allowed_origin) {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::FORBIDDEN,
+            json!({"error": "origin_not_allowed"}),
+        );
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::NO_CONTENT;
+    apply_cors_headers(&mut response, &session.allowed_origin);
+    response
+}
+
+async fn browser_command_result_preflight(
+    AxumPath((session_id, _command_id)): AxumPath<(String, String)>,
     State(state): State<BrokerState>,
     headers: HeaderMap,
 ) -> Response<Body> {
@@ -848,6 +1390,184 @@ async fn reply_asset(
     response
 }
 
+async fn browser_commands(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Query(query): Query<BrowserCommandQuery>,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    if !session.browser_control_enabled {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::CONFLICT,
+            json!({"error": "browser_control_disabled"}),
+        );
+    }
+    let page = match browser_page_from_query(&query, &session.allowed_origin) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"error": "invalid_browser_page", "message": error.to_string()}),
+            );
+        }
+    };
+
+    {
+        let mut browser = session.browser_control.lock().await;
+        browser.pages.insert(page.page_id.clone(), page.clone());
+    }
+
+    loop {
+        let notified = session.browser_command_notify.notified();
+        let command = {
+            let now = unix_time_ms_u64().unwrap_or(u64::MAX);
+            let mut browser = session.browser_control.lock().await;
+            browser
+                .commands
+                .retain(|command| command.expires_at_unix_ms > now);
+            browser
+                .commands
+                .iter()
+                .position(|command| command.page_id == page.page_id)
+                .and_then(|position| browser.commands.remove(position))
+        };
+        if let Some(command) = command {
+            return cors_json(
+                &session.allowed_origin,
+                StatusCode::OK,
+                &BrowserCommandPollResponse {
+                    version: PROTOCOL_VERSION,
+                    status: "command".into(),
+                    command: Some(command),
+                },
+            );
+        }
+        if tokio::time::timeout(BROWSER_COMMAND_POLL, notified)
+            .await
+            .is_err()
+        {
+            return cors_json(
+                &session.allowed_origin,
+                StatusCode::OK,
+                &BrowserCommandPollResponse {
+                    version: PROTOCOL_VERSION,
+                    status: "idle".into(),
+                    command: None,
+                },
+            );
+        }
+    }
+}
+
+async fn browser_command_result(
+    AxumPath((session_id, command_id)): AxumPath<(String, String)>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+    Json(result): Json<BrowserCommandResultSubmission>,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    if !session.browser_control_enabled {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::CONFLICT,
+            json!({"error": "browser_control_disabled"}),
+        );
+    }
+    let result = match validate_browser_result(result, &command_id, &session.allowed_origin) {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                json!({"error": "invalid_browser_result", "message": error.to_string()}),
+            );
+        }
+    };
+    let pending = session
+        .browser_control
+        .lock()
+        .await
+        .pending
+        .remove(&command_id);
+    let Some(pending) = pending else {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::GONE,
+            json!({"error": "browser_command_expired"}),
+        );
+    };
+    if pending.page_id != result.page_id {
+        session
+            .browser_control
+            .lock()
+            .await
+            .pending
+            .insert(command_id.clone(), pending);
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "browser_page_mismatch"}),
+        );
+    }
+    let now = match unix_time_ms_u64() {
+        Ok(value) => value,
+        Err(error) => {
+            return json_response(
+                &session.allowed_origin,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": "clock_error", "message": error.to_string()}),
+            );
+        }
+    };
+    if now > pending.expires_at_unix_ms || pending.sender.is_closed() {
+        return json_response(
+            &session.allowed_origin,
+            StatusCode::GONE,
+            json!({"error": "browser_command_expired"}),
+        );
+    }
+    let result =
+        match finalize_browser_result(result, &pending.result_policy, &session, &command_id) {
+            Ok(value) => value,
+            Err(error) => {
+                session
+                    .browser_control
+                    .lock()
+                    .await
+                    .pending
+                    .insert(command_id.clone(), pending);
+                return json_response(
+                    &session.allowed_origin,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    json!({"error": "invalid_browser_result", "message": error.to_string()}),
+                );
+            }
+        };
+    let _ = pending.sender.send(result);
+    cors_json(
+        &session.allowed_origin,
+        StatusCode::ACCEPTED,
+        &json!({
+            "version": PROTOCOL_VERSION,
+            "status": "accepted",
+            "commandId": command_id,
+        }),
+    )
+}
+
 async fn submit_message(
     AxumPath(session_id): AxumPath<String>,
     State(state): State<BrokerState>,
@@ -915,6 +1635,17 @@ async fn submit_message(
         attachments: submission.attachments,
         image_attachments: vec![],
     };
+    let runtime_message = RuntimeUserMessage {
+        message_id: inbound.message_id.clone(),
+        text: inbound.text.clone(),
+        manifest_path: inbound.manifest_path.clone(),
+        screenshot_path: inbound.screenshot_path.clone(),
+        attachment_summaries: inbound
+            .attachments
+            .iter()
+            .map(|attachment| attachment.summary.clone())
+            .collect(),
+    };
     {
         let mut conversation = session.conversation.lock().await;
         conversation.messages.push(chat_message);
@@ -922,6 +1653,21 @@ async fn submit_message(
     }
     session.inbound_notify.notify_waiters();
     session.transcript_notify.notify_waiters();
+    if let Some(runtime) = session.runtime.lock().await.clone()
+        && let Err(error) = runtime.send_user_message(runtime_message).await
+    {
+        let _ = record_agent_reply(
+            &session,
+            PreparedAgentReply {
+                message: format!("Embedded agent runtime error: {error}"),
+                in_reply_to: Some(message_id.clone()),
+                attachments: vec![],
+            },
+        )
+        .await;
+    } else {
+        let _ = persist_active_transcript(&session).await;
+    }
 
     cors_json(
         &session.allowed_origin,
@@ -986,8 +1732,173 @@ async fn conversation(
     }
 }
 
+async fn browser_end_session(
+    AxumPath(session_id): AxumPath<String>,
+    State(state): State<BrokerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(session) = find_session(&state, &session_id).await else {
+        return (StatusCode::NOT_FOUND, Body::empty()).into_response();
+    };
+    if let Some(response) = browser_authorization_error(&session, &headers) {
+        return response;
+    }
+    match finish_session(&state, &session_id).await {
+        Ok(_transcript) => cors_json(
+            &session.allowed_origin,
+            StatusCode::OK,
+            &BrowserEndSessionReceipt {
+                version: PROTOCOL_VERSION,
+                status: "ended".into(),
+                session: session_id,
+            },
+        ),
+        Err(error) => json_response(
+            &session.allowed_origin,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            json!({"error": "end_session_failed", "message": error.to_string()}),
+        ),
+    }
+}
+
 async fn find_session(state: &BrokerState, session_id: &str) -> Option<SessionState> {
     state.sessions.lock().await.get(session_id).cloned()
+}
+
+fn spawn_runtime_event_listener(
+    session: SessionState,
+    mut events: tokio::sync::mpsc::Receiver<RuntimeEvent>,
+) {
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if session.ended.load(Ordering::Acquire) {
+                break;
+            }
+            let message = match event {
+                RuntimeEvent::AssistantMessage(message) => message,
+                RuntimeEvent::Error(message) => format!("Embedded agent runtime error: {message}"),
+            };
+            if let Err(error) = record_agent_reply(
+                &session,
+                PreparedAgentReply {
+                    message,
+                    in_reply_to: None,
+                    attachments: vec![],
+                },
+            )
+            .await
+            {
+                eprintln!(
+                    "AgentNudge could not record embedded agent output for {}: {error:#}",
+                    session.session_id
+                );
+            }
+        }
+    });
+}
+
+async fn current_transcript(state: &BrokerState, session_id: &str) -> Option<SessionTranscript> {
+    if let Some(session) = find_session(state, session_id).await {
+        return Some(build_transcript(&session, "active", None).await);
+    }
+    state
+        .completed_sessions
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+}
+
+async fn build_transcript(
+    session: &SessionState,
+    status: &str,
+    ended_at_unix_ms: Option<u128>,
+) -> SessionTranscript {
+    let messages = session.conversation.lock().await.messages.clone();
+    let runtime = match session.runtime.lock().await.clone() {
+        Some(handle) => Some(handle.snapshot().await),
+        None => None,
+    };
+    SessionTranscript {
+        version: PROTOCOL_VERSION,
+        status: status.into(),
+        session: session.session_id.clone(),
+        started_at_unix_ms: session.started_at_unix_ms,
+        ended_at_unix_ms,
+        runtime,
+        messages,
+        transcript_path: session.transcript_path.display().to_string(),
+    }
+}
+
+async fn persist_active_transcript(session: &SessionState) -> Result<SessionTranscript> {
+    let transcript = build_transcript(session, "active", None).await;
+    write_private_json_atomic(&session.transcript_path, &transcript)?;
+    Ok(transcript)
+}
+
+async fn finish_session(state: &BrokerState, session_id: &str) -> Result<SessionTranscript> {
+    if let Some(transcript) = state
+        .completed_sessions
+        .lock()
+        .await
+        .get(session_id)
+        .cloned()
+    {
+        return Ok(transcript);
+    }
+    let session = find_session(state, session_id)
+        .await
+        .with_context(|| format!("AgentNudge session `{session_id}` is not active"))?;
+    let notified = session.completion_notify.notified();
+    if session.ended.swap(true, Ordering::AcqRel) {
+        notified.await;
+        return state
+            .completed_sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .context("the AgentNudge session ended without a transcript");
+    }
+
+    if let Some(runtime) = session.runtime.lock().await.clone()
+        && let Err(error) = runtime.shutdown().await
+    {
+        eprintln!("AgentNudge embedded runtime shutdown warning for {session_id}: {error:#}");
+    }
+    {
+        let mut browser = session.browser_control.lock().await;
+        browser.commands.clear();
+        browser.pending.clear();
+        browser.pages.clear();
+    }
+    let transcript = build_transcript(&session, "ended", Some(unix_time_ms()?)).await;
+    if let Err(error) = write_private_json_atomic(&session.transcript_path, &transcript) {
+        eprintln!("AgentNudge could not persist the final transcript for {session_id}: {error:#}");
+    }
+    state
+        .completed_sessions
+        .lock()
+        .await
+        .insert(session_id.into(), transcript.clone());
+    state.sessions.lock().await.remove(session_id);
+
+    session.inbound_notify.notify_waiters();
+    session.transcript_notify.notify_waiters();
+    session.browser_command_notify.notify_waiters();
+    session.completion_notify.notify_waiters();
+    Ok(transcript)
+}
+
+fn validate_runtime_config(config: &RuntimeLaunchConfig) -> Result<()> {
+    if !config.cwd.is_absolute() || !config.cwd.is_dir() {
+        bail!("the runtime workspace must be an existing absolute directory");
+    }
+    if config.context.chars().count() > MAX_RUNTIME_CONTEXT_CHARS {
+        bail!("runtime context exceeds {MAX_RUNTIME_CONTEXT_CHARS} characters");
+    }
+    Ok(())
 }
 
 async fn wait_on_session(state: &SessionState, duration: Duration) -> WaitResponse {
@@ -1243,6 +2154,236 @@ fn validate_wait(duration: Duration) -> Result<()> {
     Ok(())
 }
 
+fn validate_browser_action(action: &mut BrowserAction, allowed_origin: &str) -> Result<()> {
+    match action {
+        BrowserAction::Snapshot | BrowserAction::Screenshot | BrowserAction::Reload => {}
+        BrowserAction::Click { selector } | BrowserAction::WaitFor { selector } => {
+            sanitize_browser_selector(selector)?;
+        }
+        BrowserAction::Fill { selector, text } => {
+            sanitize_browser_selector(selector)?;
+            if text.chars().count() > MAX_BROWSER_FILL_CHARS {
+                bail!("browser fill text exceeds {MAX_BROWSER_FILL_CHARS} characters");
+            }
+        }
+        BrowserAction::Scroll { selector, x, y } => {
+            if let Some(selector) = selector {
+                sanitize_browser_selector(selector)?;
+            }
+            for coordinate in [x.as_ref(), y.as_ref()].into_iter().flatten() {
+                if !coordinate.is_finite() || coordinate.abs() > 10_000_000.0 {
+                    bail!("browser scroll coordinates must be finite and bounded");
+                }
+            }
+            if selector.is_none() && x.is_none() && y.is_none() {
+                bail!("browser scroll needs a selector, --x, or --y");
+            }
+        }
+        BrowserAction::Navigate { url } => {
+            let base = Url::parse(&format!("{allowed_origin}/"))?;
+            let resolved = base
+                .join(url.trim())
+                .context("the browser navigation URL is invalid")?;
+            if origin_string(&resolved)? != allowed_origin {
+                bail!("browser navigation must remain on the session's allowed origin");
+            }
+            *url = resolved.to_string();
+        }
+    }
+    Ok(())
+}
+
+fn browser_result_policy(action: &BrowserAction) -> BrowserResultPolicy {
+    match action {
+        BrowserAction::Fill { text, .. } => BrowserResultPolicy::Fill {
+            characters: text.chars().count(),
+        },
+        BrowserAction::Screenshot => BrowserResultPolicy::Screenshot,
+        _ => BrowserResultPolicy::Standard,
+    }
+}
+
+fn sanitize_browser_selector(selector: &mut String) -> Result<()> {
+    *selector = selector.trim().to_string();
+    if selector.is_empty() {
+        bail!("browser actions need a non-empty CSS selector");
+    }
+    if selector.chars().count() > MAX_BROWSER_SELECTOR_CHARS {
+        bail!("browser selector exceeds {MAX_BROWSER_SELECTOR_CHARS} characters");
+    }
+    Ok(())
+}
+
+fn select_browser_page(browser: &BrowserControlState, requested: Option<&str>) -> Result<String> {
+    if let Some(requested) = requested {
+        let requested = validate_page_id(requested)?;
+        if browser.pages.contains_key(&requested) {
+            return Ok(requested);
+        }
+        bail!("browser page `{requested}` is not connected to this session");
+    }
+    match browser.pages.len() {
+        0 => bail!("no browser page is connected; load the session widget first"),
+        1 => Ok(browser.pages.keys().next().cloned().unwrap()),
+        _ => bail!("more than one browser page is connected; pass --page with a page ID"),
+    }
+}
+
+fn browser_page_from_query(
+    query: &BrowserCommandQuery,
+    allowed_origin: &str,
+) -> Result<BrowserPage> {
+    let page_id = validate_page_id(&query.page_id)?;
+    let url = sanitize_browser_url(&query.url, allowed_origin)?;
+    Ok(BrowserPage {
+        page_id,
+        url,
+        title: truncate_string(query.title.trim(), 500),
+        last_seen_unix_ms: unix_time_ms_u64()?,
+    })
+}
+
+fn validate_browser_result(
+    mut result: BrowserCommandResultSubmission,
+    expected_command_id: &str,
+    allowed_origin: &str,
+) -> Result<BrowserCommandResultSubmission> {
+    let command_id = Uuid::parse_str(result.command_id.trim())
+        .context("the browser command ID is invalid")?
+        .to_string();
+    if command_id != expected_command_id {
+        bail!("the browser result command ID does not match the route");
+    }
+    result.command_id = command_id;
+    result.page_id = validate_page_id(&result.page_id)?;
+    if !matches!(result.status.as_str(), "completed" | "error") {
+        bail!("browser result status must be `completed` or `error`");
+    }
+    result.error = result
+        .error
+        .take()
+        .map(|value| truncate_string(value.trim(), 2_000))
+        .filter(|value| !value.is_empty());
+    if result.status == "error" && result.error.is_none() {
+        bail!("an error browser result needs an error message");
+    }
+    if result.status == "completed" {
+        result.error = None;
+    }
+    result.current_url = sanitize_browser_url(&result.current_url, allowed_origin)?;
+    result.title = truncate_string(result.title.trim(), 500);
+    Ok(result)
+}
+
+fn finalize_browser_result(
+    mut result: BrowserCommandResultSubmission,
+    policy: &BrowserResultPolicy,
+    session: &SessionState,
+    command_id: &str,
+) -> Result<BrowserCommandResultSubmission> {
+    match policy {
+        BrowserResultPolicy::Standard => {
+            if let Some(value) = &result.value
+                && serde_json::to_vec(value)?.len() > MAX_BROWSER_RESULT_BYTES
+            {
+                bail!("browser result exceeds the {MAX_BROWSER_RESULT_BYTES}-byte limit");
+            }
+        }
+        BrowserResultPolicy::Fill { characters } => {
+            if result.status == "completed" {
+                result.value = Some(json!({"filled": true, "characters": characters}));
+                result.error = None;
+            } else {
+                result.value = None;
+                result.error =
+                    Some("the connected page reported that the fill action failed".into());
+            }
+        }
+        BrowserResultPolicy::Screenshot => {
+            if result.status == "completed" {
+                let data_url = result
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.get("screenshotDataUrl"))
+                    .and_then(serde_json::Value::as_str)
+                    .context("a completed screenshot result needs screenshotDataUrl")?;
+                let path = persist_browser_screenshot(session, command_id, data_url)?;
+                result.value = Some(json!({
+                    "screenshotPath": path.display().to_string(),
+                    "mediaType": "image/png",
+                }));
+                result.error = None;
+            } else {
+                result.value = None;
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn persist_browser_screenshot(
+    session: &SessionState,
+    command_id: &str,
+    data_url: &str,
+) -> Result<PathBuf> {
+    let bytes = decode_screenshot(data_url)?;
+    let directory = session.output.join("browser-screenshots");
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "could not create browser screenshot directory {}",
+            directory.display()
+        )
+    })?;
+    let final_path = directory.join(format!("{command_id}.png"));
+    let temporary_path = directory.join(format!(".{command_id}.tmp"));
+    if final_path.exists() || temporary_path.exists() {
+        bail!("the browser screenshot output already exists");
+    }
+    std::fs::write(&temporary_path, bytes).with_context(|| {
+        format!(
+            "could not write browser screenshot {}",
+            temporary_path.display()
+        )
+    })?;
+    if let Err(error) = std::fs::rename(&temporary_path, &final_path) {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error).with_context(|| {
+            format!(
+                "could not finalize browser screenshot {}",
+                final_path.display()
+            )
+        });
+    }
+    Ok(final_path)
+}
+
+fn validate_page_id(value: &str) -> Result<String> {
+    Ok(Uuid::parse_str(value.trim())
+        .context("the browser page ID is invalid")?
+        .to_string())
+}
+
+fn sanitize_browser_url(value: &str, allowed_origin: &str) -> Result<String> {
+    let mut url = Url::parse(value).context("the browser page URL is invalid")?;
+    if origin_string(&url)? != allowed_origin {
+        bail!("the browser page URL is outside the session's allowed origin");
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
+}
+
+fn prune_stale_browser_pages(browser: &mut BrowserControlState, now_unix_ms: u64) {
+    let threshold = now_unix_ms.saturating_sub(elapsed_ms(BROWSER_PAGE_STALE_AFTER));
+    browser
+        .pages
+        .retain(|_, page| page.last_seen_unix_ms >= threshold);
+}
+
+fn truncate_string(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 fn elapsed_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1284,6 +2425,17 @@ fn agent_bad_request(message: String) -> Response<Body> {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(json!({"error": "invalid_request", "message": message})),
+    )
+        .into_response()
+}
+
+fn browser_control_disabled() -> Response<Body> {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "browser_control_disabled",
+            "message": "this session was not armed for browser control; create it with --allow-browser-control"
+        })),
     )
         .into_response()
 }
@@ -1332,7 +2484,7 @@ fn apply_cors_headers(response: &mut Response<Body>, origin: &str) {
     headers.insert(VARY, HeaderValue::from_static("Origin"));
     headers.insert(
         ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, OPTIONS"),
+        HeaderValue::from_static("GET, POST, DELETE, OPTIONS"),
     );
     headers.insert(
         ACCESS_CONTROL_ALLOW_HEADERS,
@@ -1367,6 +2519,10 @@ fn unix_time_ms() -> Result<u128> {
         .duration_since(UNIX_EPOCH)
         .context("the system clock is before the Unix epoch")?
         .as_millis())
+}
+
+fn unix_time_ms_u64() -> Result<u64> {
+    u64::try_from(unix_time_ms()?).context("the system time does not fit in a browser timestamp")
 }
 
 fn persist_message(
@@ -1537,6 +2693,34 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+fn write_private_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("the private JSON path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("could not create {}", parent.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("private.json");
+    let temporary = parent.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| -> Result<()> {
+        write_private_json(&temporary, value)?;
+        std::fs::rename(&temporary, path).with_context(|| {
+            format!(
+                "could not atomically replace {} with {}",
+                path.display(),
+                temporary.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temporary);
+    }
+    result
+}
+
 fn remove_descriptor_if_owned(path: &Path, token: &str) {
     let owned = std::fs::read(path)
         .ok()
@@ -1621,6 +2805,24 @@ mod tests {
         headers
     }
 
+    fn agent_headers(broker: &BrokerState) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-agentnudge-agent-token",
+            HeaderValue::from_str(&broker.agent_token).unwrap(),
+        );
+        headers
+    }
+
+    fn browser_page(page_id: &str) -> BrowserPage {
+        BrowserPage {
+            page_id: page_id.into(),
+            url: "http://localhost:5173/".into(),
+            title: "Demo".into(),
+            last_seen_unix_ms: unix_time_ms_u64().unwrap(),
+        }
+    }
+
     fn png_bytes() -> Vec<u8> {
         STANDARD
             .decode(
@@ -1665,10 +2867,17 @@ mod tests {
             session_id: String::new(),
             browser_token: String::new(),
             output: PathBuf::new(),
+            transcript_path: PathBuf::new(),
+            started_at_unix_ms: 0,
             conversation: Arc::new(Mutex::new(Conversation::default())),
             reply_assets: Arc::new(Mutex::new(HashMap::new())),
             inbound_notify: Arc::new(Notify::new()),
             transcript_notify: Arc::new(Notify::new()),
+            browser_control_enabled: false,
+            browser_control: Arc::new(Mutex::new(BrowserControlState::default())),
+            browser_command_notify: Arc::new(Notify::new()),
+            runtime: Arc::new(Mutex::new(None)),
+            completion_notify: Arc::new(Notify::new()),
             ended: Arc::new(AtomicBool::new(false)),
         };
         for word in NATO_WORDS {
@@ -1776,6 +2985,7 @@ mod tests {
             &broker,
             "http://localhost:5173".into(),
             temporary.path().to_path_buf(),
+            false,
         )
         .await
         .unwrap();
@@ -1783,6 +2993,7 @@ mod tests {
             &broker,
             "http://localhost:5173".into(),
             temporary.path().to_path_buf(),
+            false,
         )
         .await
         .unwrap();
@@ -1842,6 +3053,7 @@ mod tests {
             &broker,
             "http://localhost:5173".into(),
             temporary.path().to_path_buf(),
+            false,
         )
         .await
         .unwrap();
@@ -1857,6 +3069,7 @@ mod tests {
             &broker,
             "http://localhost:5173".into(),
             temporary.path().to_path_buf(),
+            false,
         )
         .await
         .unwrap();
@@ -1887,6 +3100,7 @@ mod tests {
             &broker,
             "http://localhost:5173".into(),
             temporary.path().to_path_buf(),
+            false,
         )
         .await
         .unwrap();
@@ -1895,6 +3109,7 @@ mod tests {
             &broker,
             "http://localhost:5173".into(),
             temporary.path().to_path_buf(),
+            false,
         )
         .await
         .unwrap();
@@ -1984,5 +3199,546 @@ mod tests {
             .await
             .unwrap();
         assert!(bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+    }
+
+    #[tokio::test]
+    async fn browser_actions_require_agent_auth_and_explicit_session_opt_in() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let disabled = agent_browser_pages(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            agent_headers(&broker),
+        )
+        .await;
+        assert_eq!(disabled.status(), StatusCode::CONFLICT);
+
+        let session = find_session(&broker, &created.session).await.unwrap();
+        let browser_cannot_author_actions = agent_browser_action(
+            AxumPath(created.session),
+            State(broker),
+            browser_headers(&session),
+            Query(WaitQuery { timeout_ms: 100 }),
+            Json(BrowserActionRequest {
+                page_id: None,
+                action: BrowserAction::Snapshot,
+            }),
+        )
+        .await;
+        assert_eq!(
+            browser_cannot_author_actions.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_browser_actions_to_one_session_page_and_returns_untrusted_results() {
+        const PAGE_ID: &str = "d3dc4786-46bc-4bc4-81e0-508de3417cf9";
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let other = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        let other_session = find_session(&broker, &other.session).await.unwrap();
+        session
+            .browser_control
+            .lock()
+            .await
+            .pages
+            .insert(PAGE_ID.into(), browser_page(PAGE_ID));
+
+        let action_broker = broker.clone();
+        let action_session = created.session.clone();
+        let action_headers = agent_headers(&broker);
+        let action_task = tokio::spawn(async move {
+            agent_browser_action(
+                AxumPath(action_session),
+                State(action_broker),
+                action_headers,
+                Query(WaitQuery { timeout_ms: 2_000 }),
+                Json(BrowserActionRequest {
+                    page_id: None,
+                    action: BrowserAction::Snapshot,
+                }),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if !session.browser_control.lock().await.commands.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(session.browser_control.lock().await.commands.len(), 1);
+        assert!(
+            other_session
+                .browser_control
+                .lock()
+                .await
+                .commands
+                .is_empty()
+        );
+
+        let delivered = browser_commands(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Query(BrowserCommandQuery {
+                page_id: PAGE_ID.into(),
+                url: "http://localhost:5173/?private=yes".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        let delivered: BrowserCommandPollResponse = response_json(delivered).await;
+        let command = delivered.command.unwrap();
+        assert_eq!(command.page_id, PAGE_ID);
+        assert!(matches!(command.action, BrowserAction::Snapshot));
+
+        let wrong_browser = browser_command_result(
+            AxumPath((created.session.clone(), command.command_id.clone())),
+            State(broker.clone()),
+            browser_headers(&other_session),
+            Json(BrowserCommandResultSubmission {
+                command_id: command.command_id.clone(),
+                page_id: PAGE_ID.into(),
+                status: "completed".into(),
+                value: Some(json!({"elements": []})),
+                error: None,
+                current_url: "http://localhost:5173/".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(wrong_browser.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = browser_command_result(
+            AxumPath((created.session, command.command_id.clone())),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(BrowserCommandResultSubmission {
+                command_id: command.command_id,
+                page_id: PAGE_ID.into(),
+                status: "completed".into(),
+                value: Some(json!({"elements": [{"selector": "#save"}]})),
+                error: None,
+                current_url: "http://localhost:5173/?secret=yes".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let response: BrowserActionResponse = response_json(action_task.await.unwrap()).await;
+        assert_eq!(response.status, "completed");
+        assert_eq!(response.page_id.as_deref(), Some(PAGE_ID));
+        assert_eq!(
+            response.current_url.as_deref(),
+            Some("http://localhost:5173/")
+        );
+        assert_eq!(response.trust.page_content, "untrusted");
+    }
+
+    #[tokio::test]
+    async fn browser_fill_receipts_cannot_echo_page_supplied_text() {
+        const PAGE_ID: &str = "5a536984-a063-4dca-86fe-0414f696262b";
+        const PRIVATE_TEXT: &str = "private@example.com";
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        session
+            .browser_control
+            .lock()
+            .await
+            .pages
+            .insert(PAGE_ID.into(), browser_page(PAGE_ID));
+
+        let action_broker = broker.clone();
+        let action_session = created.session.clone();
+        let action_headers = agent_headers(&broker);
+        let action_task = tokio::spawn(async move {
+            agent_browser_action(
+                AxumPath(action_session),
+                State(action_broker),
+                action_headers,
+                Query(WaitQuery { timeout_ms: 2_000 }),
+                Json(BrowserActionRequest {
+                    page_id: None,
+                    action: BrowserAction::Fill {
+                        selector: "#email".into(),
+                        text: PRIVATE_TEXT.into(),
+                    },
+                }),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if !session.browser_control.lock().await.commands.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let delivered = browser_commands(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Query(BrowserCommandQuery {
+                page_id: PAGE_ID.into(),
+                url: "http://localhost:5173/".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        let delivered: BrowserCommandPollResponse = response_json(delivered).await;
+        let command = delivered.command.unwrap();
+
+        let accepted = browser_command_result(
+            AxumPath((created.session, command.command_id.clone())),
+            State(broker),
+            browser_headers(&session),
+            Json(BrowserCommandResultSubmission {
+                command_id: command.command_id,
+                page_id: PAGE_ID.into(),
+                status: "completed".into(),
+                value: Some(json!({"echo": PRIVATE_TEXT})),
+                error: None,
+                current_url: "http://localhost:5173/".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let response: BrowserActionResponse = response_json(action_task.await.unwrap()).await;
+        assert_eq!(
+            response.value,
+            Some(json!({"filled": true, "characters": 19}))
+        );
+        assert!(
+            !serde_json::to_string(&response)
+                .unwrap()
+                .contains(PRIVATE_TEXT)
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_screenshot_results_are_validated_and_persisted_as_png_files() {
+        const PAGE_ID: &str = "75554628-7b7b-4c9b-aa0a-433f829e5e3b";
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let session_id = created.session.clone();
+        let session = find_session(&broker, &session_id).await.unwrap();
+        session
+            .browser_control
+            .lock()
+            .await
+            .pages
+            .insert(PAGE_ID.into(), browser_page(PAGE_ID));
+
+        let action_broker = broker.clone();
+        let action_session = session_id.clone();
+        let action_headers = agent_headers(&broker);
+        let action_task = tokio::spawn(async move {
+            agent_browser_action(
+                AxumPath(action_session),
+                State(action_broker),
+                action_headers,
+                Query(WaitQuery { timeout_ms: 2_000 }),
+                Json(BrowserActionRequest {
+                    page_id: None,
+                    action: BrowserAction::Screenshot,
+                }),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if !session.browser_control.lock().await.commands.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let delivered = browser_commands(
+            AxumPath(session_id.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Query(BrowserCommandQuery {
+                page_id: PAGE_ID.into(),
+                url: "http://localhost:5173/".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        let delivered: BrowserCommandPollResponse = response_json(delivered).await;
+        let command = delivered.command.unwrap();
+        assert!(matches!(command.action, BrowserAction::Screenshot));
+
+        let rejected = browser_command_result(
+            AxumPath((session_id.clone(), command.command_id.clone())),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(BrowserCommandResultSubmission {
+                command_id: command.command_id.clone(),
+                page_id: PAGE_ID.into(),
+                status: "completed".into(),
+                value: Some(json!({"screenshotDataUrl": "data:image/png;base64,aGVsbG8="})),
+                error: None,
+                current_url: "http://localhost:5173/".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            session
+                .browser_control
+                .lock()
+                .await
+                .pending
+                .contains_key(&command.command_id)
+        );
+
+        let accepted = browser_command_result(
+            AxumPath((session_id.clone(), command.command_id.clone())),
+            State(broker),
+            browser_headers(&session),
+            Json(BrowserCommandResultSubmission {
+                command_id: command.command_id,
+                page_id: PAGE_ID.into(),
+                status: "completed".into(),
+                value: Some(json!({"screenshotDataUrl": ONE_PIXEL_PNG})),
+                error: None,
+                current_url: "http://localhost:5173/?private=yes".into(),
+                title: "Demo".into(),
+            }),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let response: BrowserActionResponse = response_json(action_task.await.unwrap()).await;
+        let screenshot_path = PathBuf::from(
+            response
+                .value
+                .as_ref()
+                .and_then(|value| value.get("screenshotPath"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap(),
+        );
+        assert!(
+            screenshot_path.starts_with(
+                temporary
+                    .path()
+                    .join(session_id)
+                    .join("browser-screenshots")
+            )
+        );
+        assert_eq!(std::fs::read(screenshot_path).unwrap(), png_bytes());
+        assert_eq!(response.value.as_ref().unwrap()["mediaType"], "image/png");
+    }
+
+    #[tokio::test]
+    async fn browser_action_timeout_cleans_the_session_queue() {
+        const PAGE_ID: &str = "a1818c91-e5ac-49ae-9b63-90062661c836";
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        session
+            .browser_control
+            .lock()
+            .await
+            .pages
+            .insert(PAGE_ID.into(), browser_page(PAGE_ID));
+        let response = agent_browser_action(
+            AxumPath(created.session),
+            State(broker.clone()),
+            agent_headers(&broker),
+            Query(WaitQuery { timeout_ms: 5 }),
+            Json(BrowserActionRequest {
+                page_id: None,
+                action: BrowserAction::Click {
+                    selector: "#save".into(),
+                },
+            }),
+        )
+        .await;
+        let response: BrowserActionResponse = response_json(response).await;
+        assert_eq!(response.status, "timeout");
+        let control = session.browser_control.lock().await;
+        assert!(control.commands.is_empty());
+        assert!(control.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_completes_a_pending_browser_action() {
+        const PAGE_ID: &str = "33f2ddba-86e8-4f3d-8bfd-100f8283351b";
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        session
+            .browser_control
+            .lock()
+            .await
+            .pages
+            .insert(PAGE_ID.into(), browser_page(PAGE_ID));
+
+        let action_broker = broker.clone();
+        let action_session = created.session.clone();
+        let action_headers = agent_headers(&broker);
+        let action_task = tokio::spawn(async move {
+            agent_browser_action(
+                AxumPath(action_session),
+                State(action_broker),
+                action_headers,
+                Query(WaitQuery { timeout_ms: 10_000 }),
+                Json(BrowserActionRequest {
+                    page_id: None,
+                    action: BrowserAction::Snapshot,
+                }),
+            )
+            .await
+        });
+        for _ in 0..100 {
+            if !session.browser_control.lock().await.pending.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let ended = delete_session(
+            AxumPath(created.session),
+            State(broker.clone()),
+            agent_headers(&broker),
+        )
+        .await;
+        assert_eq!(ended.status(), StatusCode::OK);
+        let response: BrowserActionResponse = response_json(action_task.await.unwrap()).await;
+        assert_eq!(response.status, "ended");
+    }
+
+    #[tokio::test]
+    async fn browser_close_persists_a_final_transcript_for_agent_queries() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            false,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        let submitted = submit_message(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Json(submission(&created.session)),
+        )
+        .await;
+        assert_eq!(submitted.status(), StatusCode::ACCEPTED);
+        record_agent_reply(
+            &session,
+            PreparedAgentReply {
+                message: "I can move that button.".into(),
+                in_reply_to: None,
+                attachments: vec![],
+            },
+        )
+        .await
+        .unwrap();
+
+        let active = agent_transcript(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            agent_headers(&broker),
+        )
+        .await;
+        let active: SessionTranscript = response_json(active).await;
+        assert_eq!(active.status, "active");
+        assert_eq!(active.messages.len(), 2);
+
+        let ended = browser_end_session(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+        )
+        .await;
+        assert_eq!(ended.status(), StatusCode::OK);
+        let ended: serde_json::Value = response_json(ended).await;
+        assert_eq!(ended["status"], "ended");
+        assert!(ended.get("transcript").is_none());
+        assert!(ended.get("transcriptPath").is_none());
+        assert!(find_session(&broker, &created.session).await.is_none());
+
+        let archived = agent_transcript(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            agent_headers(&broker),
+        )
+        .await;
+        let archived: SessionTranscript = response_json(archived).await;
+        assert_eq!(archived.status, "ended");
+        assert_eq!(archived.messages.len(), 2);
+        assert!(Path::new(&archived.transcript_path).is_file());
+
+        let completion = agent_completion(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            agent_headers(&broker),
+            Query(WaitQuery { timeout_ms: 0 }),
+        )
+        .await;
+        let completion: SessionCompletionResponse = response_json(completion).await;
+        assert_eq!(completion.status, "ended");
+        assert_eq!(completion.transcript.unwrap().session, created.session);
     }
 }

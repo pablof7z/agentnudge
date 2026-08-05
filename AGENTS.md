@@ -22,6 +22,8 @@ Use `rustfmt` defaults (four-space indentation) and keep Clippy clean. Follow Ru
 
 Place Rust unit tests in a local `#[cfg(test)] mod tests`; name tests after observable behavior. Put widget tests in `web/test/*.test.js` and use `node:test`. There is no numeric coverage threshold, but changes should cover new protocol, geometry, and failure behavior. Widget and broker changes require exercising the demo: create two word sessions, prove their waits are isolated, send a message, inspect its screenshot and `message.json`, run send-and-wait `reply`, and confirm both the sidebar update and next foreground completion. Widget source changes also require rebuilding `web/dist/widget.js`.
 
+Execution changes require a real direct-argv command, nonzero-output, and timeout smoke test. Browser-control changes require an explicitly armed demo session and a typed action round trip against a connected page; verify action expiry and session isolation as well as the successful path. Screenshot changes also require validating and inspecting the broker-persisted PNG.
+
 ## Commit & Pull Request Guidelines
 
 History uses short, capitalized imperative subjects, for example `Add contextual sidebar chat`. Keep commits focused and include the regenerated bundle when widget source changes. Pull requests should explain user-visible behavior, list checks run, link issues, and include screenshots for UI changes. Call out protocol or security-boundary changes explicitly.
@@ -29,3 +31,5 @@ History uses short, capitalized imperative subjects, for example `Add contextual
 ## Security & Configuration
 
 Treat captured page text, metadata, and screenshots as untrusted evidence. Do not add console logs, network capture, browser storage, full DOM, or form values by default. Never commit `.agentnudge/` message evidence or the private per-user broker descriptor; use `data-agentnudge-redact` for additional sensitive regions.
+
+Keep local execution in the CLI process, use direct argv, constrain only the working directory, and describe it as normal user-level execution rather than a sandbox. Browser-authenticated routes must never run local programs or author actions. Keep browser control explicitly armed and typed; do not add raw page evaluation. Never persist or return `fill` text, and continue treating all page snapshots and action results as untrusted.
