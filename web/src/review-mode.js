@@ -1,9 +1,11 @@
 import html2canvas from "html2canvas";
 import { pointInClosedPath } from "./annotation-geometry.js";
 import { renderMarkdown } from "./markdown.js";
+import { paintReviewMarks } from "./review-capture.js";
 import {
   buildGroupedReviewPayload,
   buildThreadQuestionPayload,
+  beginThreadQuestion,
   createReviewThread,
   drawingBounds,
   referenceLabel,
@@ -301,6 +303,8 @@ export class AgentNudgeReview extends HTMLElement {
     this.hoverRect = null;
     this.pendingRect = null;
     this.currentStroke = null;
+    this.currentStrokeThreadId = null;
+    this.revealThreadAfterStroke = false;
     this.suppressNextClick = false;
     this.movingCard = false;
     this.sending = false;
@@ -520,10 +524,11 @@ export class AgentNudgeReview extends HTMLElement {
     if (this.sending) return;
     this.localEdits = true;
     const existing = this.activeThread();
-    if (existing) {
+    if (existing && !existing.asking) {
       this.focusComposer();
       return;
     }
+    if (existing?.asking) this.detachAskingThread();
     this.pushUndo();
     const anchor = { x: Math.max(36, window.innerWidth - 330), y: Math.max(36, window.innerHeight - 190) };
     const thread = this.createThread(anchor, null);
@@ -534,10 +539,6 @@ export class AgentNudgeReview extends HTMLElement {
 
   onPointerDown(event) {
     if (!this.opened || this.mode === "idle" || this.movingCard || event.composedPath().includes(this)) return;
-    if (this.activeThread()?.asking && ["draw", "target", "region"].includes(this.mode)) {
-      this.setStatus("Wait for this thread's agent reply before changing its marks.");
-      return;
-    }
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
     this.localEdits = true;
@@ -545,6 +546,10 @@ export class AgentNudgeReview extends HTMLElement {
     event.preventDefault();
     event.stopImmediatePropagation();
     this.suppressNextClick = true;
+
+    if (this.activeThread()?.asking && ["draw", "target", "region"].includes(this.mode)) {
+      this.detachAskingThread();
+    }
 
     if (this.mode === "select") {
       const hit = this.hitStroke(point);
@@ -562,8 +567,10 @@ export class AgentNudgeReview extends HTMLElement {
 
     if (this.mode === "draw") {
       this.pushUndo();
-      const thread = this.activeThread() || this.createThread(point, null);
-      this.activeThreadId = thread.id;
+      const active = this.activeThread();
+      const thread = active || this.createThread(point, null);
+      this.currentStrokeThreadId = thread.id;
+      this.revealThreadAfterStroke = !active;
       let reference = thread.references.find((value) => value.kind === "drawing");
       if (!reference) {
         this.referenceCounter += 1;
@@ -585,7 +592,7 @@ export class AgentNudgeReview extends HTMLElement {
       };
       reference.strokes.push(this.currentStroke);
       reference.rect = drawingBounds(reference.strokes);
-      this.render();
+      this.renderReferences();
       return;
     }
 
@@ -609,7 +616,7 @@ export class AgentNudgeReview extends HTMLElement {
       const last = this.currentStroke.points.at(-1);
       if (!last || pointDistance(point, last) >= 1.5) {
         this.currentStroke.points.push(point);
-        const thread = this.activeThread();
+        const thread = this.threads.find((value) => value.id === this.currentStrokeThreadId);
         const reference = thread?.references.find((value) => value.kind === "drawing");
         if (reference) reference.rect = drawingBounds(reference.strokes);
         this.renderReferences();
@@ -642,7 +649,15 @@ export class AgentNudgeReview extends HTMLElement {
         const first = this.currentStroke.points[0];
         this.currentStroke.points.push({ x: first.x + .01, y: first.y + .01 });
       }
+      const threadId = this.currentStrokeThreadId;
+      const revealThread = this.revealThreadAfterStroke;
       this.currentStroke = null;
+      this.currentStrokeThreadId = null;
+      this.revealThreadAfterStroke = false;
+      if (revealThread && this.threads.some((thread) => thread.id === threadId)) {
+        this.activeThreadId = threadId;
+        this.highlightedThreadId = threadId;
+      }
       this.render();
       this.focusComposer(false);
       return;
@@ -745,6 +760,15 @@ export class AgentNudgeReview extends HTMLElement {
     return this.threads.find((thread) => thread.id === this.activeThreadId) || null;
   }
 
+  detachAskingThread() {
+    const thread = this.activeThread();
+    if (!thread?.asking) return;
+    thread.pending = true;
+    this.activeThreadId = null;
+    this.highlightedThreadId = null;
+    this.render();
+  }
+
   async askThread(threadId) {
     const thread = this.threads.find((value) => value.id === threadId);
     const message = thread?.draft.trim();
@@ -753,17 +777,17 @@ export class AgentNudgeReview extends HTMLElement {
       this.setStatus("Start the session with an embedded agent to ask inline questions.");
       return;
     }
-    const referenceIds = thread.references.map((_, index) => referenceLabel(thread, index));
-    const userMessage = { role: "user", text: message, referenceIds };
-    thread.conversation.push(userMessage);
-    thread.draft = "";
-    thread.feedbackText = "";
-    thread.asking = true;
+    const userMessage = beginThreadQuestion(thread, message);
+    const captureThreads = [structuredClone(thread)];
+    if (this.activeThreadId === thread.id) {
+      this.activeThreadId = null;
+      this.highlightedThreadId = null;
+    }
     this.render();
     this.setStatus("Capturing context for the embedded agent.");
     let accepted = false;
     try {
-      const screenshotDataUrl = await this.captureScreenshot();
+      const screenshotDataUrl = await this.captureScreenshot(captureThreads);
       const current = this.threads.find((value) => value.id === threadId);
       if (!current) return;
       const response = await fetch(reviewThreadMessagesUrl(ENDPOINT, threadId), {
@@ -802,6 +826,11 @@ export class AgentNudgeReview extends HTMLElement {
       if (!accepted) {
         current.conversation = current.conversation.filter((value) => value !== userMessage);
         current.draft = message;
+        if (!this.activeThreadId) {
+          current.pending = false;
+          this.activeThreadId = current.id;
+          this.highlightedThreadId = current.id;
+        }
       }
       current.asking = false;
       this.setStatus(accepted ? "The embedded agent reply was interrupted." : "The question could not be sent.");
@@ -1011,6 +1040,8 @@ export class AgentNudgeReview extends HTMLElement {
     this.hoverRect = null;
     this.pendingRect = null;
     this.currentStroke = null;
+    this.currentStrokeThreadId = null;
+    this.revealThreadAfterStroke = false;
   }
 
   resolveReferenceRect(reference) {
@@ -1033,7 +1064,7 @@ export class AgentNudgeReview extends HTMLElement {
     this.renderReferences();
   }
 
-  async captureScreenshot() {
+  async captureScreenshot(threads = this.threads) {
     const canvas = await html2canvas(document.documentElement, {
       backgroundColor: getComputedStyle(document.documentElement).backgroundColor || "#ffffff",
       logging: false,
@@ -1066,11 +1097,11 @@ export class AgentNudgeReview extends HTMLElement {
       },
     });
     const context = canvas.getContext("2d");
-    paintThreads({
+    paintReviewMarks({
       context,
       canvas,
       viewport: { width: window.innerWidth, height: window.innerHeight },
-      threads: this.threads,
+      threads,
       resolveReferenceRect: (reference) => this.resolveReferenceRect(reference),
     });
     return canvas.toDataURL("image/png");
@@ -1617,134 +1648,6 @@ function autoSizeTextarea(textarea) {
 
 function colorWithAlpha(color, alpha) {
   return `${color}${alpha}`;
-}
-
-function paintThreads({ context, canvas, viewport, threads, resolveReferenceRect }) {
-  const scaleX = canvas.width / viewport.width;
-  const scaleY = canvas.height / viewport.height;
-  context.save();
-  try {
-    context.setTransform(scaleX, 0, 0, scaleY, 0, 0);
-    for (const thread of threads) {
-      thread.references.forEach((reference, index) => {
-        const rect = resolveReferenceRect(reference);
-        if (reference.kind === "drawing") {
-          for (const stroke of reference.strokes) drawStroke(context, stroke, thread.color);
-        } else if (rect) {
-          context.fillStyle = colorWithAlpha(thread.color, "14");
-          context.strokeStyle = thread.color;
-          context.lineWidth = 2;
-          context.fillRect(rect.x, rect.y, rect.width, rect.height);
-          context.strokeRect(rect.x, rect.y, rect.width, rect.height);
-        }
-        if (rect) drawMarker(context, rect, referenceLabel(thread, index), thread.color);
-      });
-      if (!thread.references.length) {
-        drawMarker(context, { x: thread.anchor.x - 1, y: thread.anchor.y - 1, width: 2, height: 2 }, String(thread.number), thread.color);
-      }
-      drawSummaryCard(context, thread);
-    }
-  } finally {
-    context.restore();
-  }
-}
-
-function drawStroke(context, stroke, color) {
-  if (!stroke.points.length) return;
-  context.save();
-  context.strokeStyle = color;
-  context.lineWidth = stroke.width;
-  context.lineCap = "round";
-  context.lineJoin = "round";
-  context.beginPath();
-  context.moveTo(stroke.points[0].x, stroke.points[0].y);
-  for (const point of stroke.points.slice(1)) context.lineTo(point.x, point.y);
-  context.stroke();
-  context.restore();
-}
-
-function drawMarker(context, rect, label, color) {
-  const x = Math.max(15, rect.x + 7);
-  const y = Math.max(15, rect.y + 7);
-  context.save();
-  context.beginPath();
-  context.arc(x, y, 13, 0, Math.PI * 2);
-  context.fillStyle = color;
-  context.fill();
-  context.strokeStyle = "#fffaf5";
-  context.lineWidth = 2;
-  context.stroke();
-  context.fillStyle = "#fff";
-  context.font = "800 9px ui-sans-serif, -apple-system, sans-serif";
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.fillText(label, x, y + .5);
-  context.restore();
-}
-
-function drawSummaryCard(context, thread) {
-  const width = Math.min(292, window.innerWidth - 24);
-  const lines = wrapCanvasText(context, threadDisplayText(thread), width - 24).slice(0, 5);
-  const height = 49 + Math.max(1, lines.length) * 16;
-  const { x, y } = thread.cardPosition;
-  context.save();
-  context.shadowColor = "rgba(40, 34, 24, .18)";
-  context.shadowBlur = 20;
-  context.shadowOffsetY = 7;
-  context.fillStyle = "#fffefa";
-  context.strokeStyle = thread.color;
-  context.lineWidth = 1;
-  roundedRect(context, x, y, width, height, 11);
-  context.fill();
-  context.shadowColor = "transparent";
-  context.stroke();
-  context.fillStyle = thread.color;
-  roundedRect(context, x, y, width, 4, 2);
-  context.fill();
-  context.beginPath();
-  context.arc(x + 21, y + 24, 11, 0, Math.PI * 2);
-  context.fillStyle = thread.color;
-  context.fill();
-  context.fillStyle = "#fff";
-  context.font = "800 10px ui-sans-serif, -apple-system, sans-serif";
-  context.textAlign = "center";
-  context.textBaseline = "middle";
-  context.fillText(String(thread.number), x + 21, y + 24.5);
-  context.fillStyle = "#27251f";
-  context.font = "12px ui-sans-serif, -apple-system, sans-serif";
-  context.textAlign = "left";
-  lines.forEach((line, index) => context.fillText(line, x + 12, y + 48 + index * 16));
-  context.restore();
-}
-
-function wrapCanvasText(context, value, maxWidth) {
-  context.font = "12px ui-sans-serif, -apple-system, sans-serif";
-  const lines = [];
-  for (const paragraph of String(value).split("\n")) {
-    let line = "";
-    for (const word of paragraph.split(/\s+/).filter(Boolean)) {
-      const candidate = line ? `${line} ${word}` : word;
-      if (line && context.measureText(candidate).width > maxWidth) {
-        lines.push(line);
-        line = word;
-      } else {
-        line = candidate;
-      }
-    }
-    lines.push(line || " ");
-  }
-  return lines;
-}
-
-function roundedRect(context, x, y, width, height, radius) {
-  const amount = Math.min(radius, width / 2, height / 2);
-  context.beginPath();
-  context.moveTo(x + amount, y);
-  context.arcTo(x + width, y, x + width, y + height, amount);
-  context.arcTo(x + width, y + height, x, y + height, amount);
-  context.arcTo(x, y + height, x, y, amount);
-  context.arcTo(x, y, x + width, y, amount);
-  context.closePath();
 }
 
 function normalizeReviewState(state) {

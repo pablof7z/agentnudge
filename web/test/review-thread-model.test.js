@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildGroupedReviewPayload,
   buildThreadQuestionPayload,
+  beginThreadQuestion,
   createReviewThread,
   groupedReviewAttachments,
   referenceLabel,
@@ -91,6 +92,19 @@ test("builds a thread-scoped question with its grouped context", () => {
   assert.equal(payload.text, "Why is this so tall?");
   assert.equal(payload.attachments.length, 1);
   assert.match(payload.attachments[0].comment, /\[1A · Thread 1\]/);
+});
+
+test("moves an asked thread into the pending stack while the agent runs", () => {
+  const value = thread();
+  value.draft = "What is this for?";
+  value.references.push({ id: "ref-1", kind: "region" });
+
+  const message = beginThreadQuestion(value, value.draft);
+
+  assert.equal(value.asking, true);
+  assert.equal(value.pending, true);
+  assert.equal(value.draft, "");
+  assert.deepEqual(message.referenceIds, ["1A"]);
 });
 
 test("scopes review conversation URLs to one encoded thread", () => {

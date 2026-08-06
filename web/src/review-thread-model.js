@@ -57,6 +57,20 @@ export function buildThreadQuestionPayload({ sessionId, thread, question, page, 
   };
 }
 
+export function beginThreadQuestion(thread, message) {
+  const userMessage = {
+    role: "user",
+    text: message,
+    referenceIds: thread.references.map((_, index) => referenceLabel(thread, index)),
+  };
+  thread.conversation.push(userMessage);
+  thread.draft = "";
+  thread.feedbackText = "";
+  thread.asking = true;
+  thread.pending = true;
+  return userMessage;
+}
+
 export function reviewThreadMessagesUrl(endpoint, threadId) {
   return `${endpoint}/review/threads/${encodeURIComponent(threadId)}/messages`;
 }
