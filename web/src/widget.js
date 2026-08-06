@@ -6,6 +6,10 @@ import {
   performBrowserAction,
   safePageUrl,
 } from "./browser-control.js";
+import { awaitingAgentAfterMessages, messageAuthorLabel } from "./chat-state.js";
+import { renderMarkdown } from "./markdown.js";
+import { renderContextAttachments } from "./message-attachments.js";
+import { AgentNudgeReview, REVIEW_HOST_ID } from "./review-mode.js";
 import { replyImageLabel, replyImageRequestUrl } from "./reply-images.js";
 import { endSessionRequestUrl } from "./session-lifecycle.js";
 import {
@@ -20,6 +24,7 @@ import iconCheck from "@tabler/icons/outline/check.svg";
 import iconDoorExit from "@tabler/icons/outline/door-exit.svg";
 import iconMessage from "@tabler/icons/outline/message-dots.svg";
 import iconMicrophone from "@tabler/icons/outline/microphone.svg";
+import iconNote from "@tabler/icons/outline/note.svg";
 import iconPencil from "@tabler/icons/outline/pencil.svg";
 import iconPointer from "@tabler/icons/outline/pointer.svg";
 import iconRectangle from "@tabler/icons/outline/square-dashed.svg";
@@ -103,7 +108,9 @@ const css = String.raw`
   .launcher:hover { background: var(--raised); transform: translateY(-1px); }
   .launcher:active { transform: scale(.96); }
   .launcher svg { width: 21px; height: 21px; }
+  .launcher[data-sent="true"] { background: var(--accent); border-color: var(--accent); color: white; }
   .shell[data-open="true"] .launcher { opacity: 0; transform: translateX(16px) scale(.82); pointer-events: none; }
+  .shell[data-review="true"] .launcher { opacity: 0; transform: translateX(16px) scale(.82); pointer-events: none; }
 
   .sidebar {
     position: fixed;
@@ -187,21 +194,49 @@ const css = String.raw`
   .message { display: flex; flex-direction: column; align-items: flex-start; margin: 0 0 18px; }
   .message.user { align-items: flex-end; }
   .message-label { margin: 0 5px 5px; color: var(--faint); font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
-  .bubble { max-width: 88%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 14px 14px 14px 4px; background: var(--raised); color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; box-shadow: 0 2px 7px rgb(24 22 18 / .04); }
+  .bubble { min-width: 0; max-width: 88%; padding: 10px 12px; border: 1px solid var(--line); border-radius: 14px 14px 14px 4px; background: var(--raised); color: var(--text); overflow-wrap: anywhere; box-shadow: 0 2px 7px rgb(24 22 18 / .04); }
   .user .bubble { border-color: color-mix(in srgb, var(--accent) 22%, var(--line)); border-radius: 14px 14px 4px 14px; background: var(--accent-soft); color: var(--accent-text); box-shadow: none; }
-  .message-attachments { width: min(88%, 310px); display: flex; flex-wrap: wrap; justify-content: inherit; gap: 6px; margin-top: 7px; }
+  .plain-message { white-space: pre-wrap; }
+  .message-markdown { line-height: 1.5; }
+  .message-markdown > :first-child { margin-top: 0; }
+  .message-markdown > :last-child { margin-bottom: 0; }
+  .message-markdown p, .message-markdown ul, .message-markdown ol, .message-markdown blockquote, .message-markdown pre { margin: .65em 0; }
+  .message-markdown ul, .message-markdown ol { padding-left: 1.35em; }
+  .message-markdown li + li { margin-top: .25em; }
+  .message-markdown h1, .message-markdown h2, .message-markdown h3, .message-markdown h4 { margin: .85em 0 .35em; font-size: 1em; line-height: 1.3; }
+  .message-markdown blockquote { padding-left: 10px; border-left: 2px solid var(--line); color: var(--muted); }
+  .message-markdown code { padding: 1px 4px; border-radius: 5px; background: var(--soft); font: .9em ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .message-markdown pre { max-width: 100%; overflow-x: auto; padding: 9px 10px; border-radius: 8px; background: var(--soft); white-space: pre; }
+  .message-markdown pre code { padding: 0; background: transparent; }
+  .message-markdown a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  .message-markdown hr { height: 1px; margin: .9em 0; border: 0; background: var(--line); }
+  .message-attachments { width: 100%; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .message-attachment { min-width: 0; max-width: 100%; display: flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; padding: 4px 8px 4px 4px; background: var(--panel); color: var(--muted); cursor: pointer; }
+  .user .message-attachment { border-color: color-mix(in srgb, var(--accent) 30%, transparent); background: color-mix(in srgb, var(--raised) 34%, transparent); color: var(--accent-text); }
   .message-attachment:hover, .message-attachment[data-active="true"] { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); color: var(--text); }
   .attachment-number { width: 20px; height: 20px; flex: none; display: grid; place-items: center; border-radius: 50%; background: var(--accent); color: #fffaf6; font-size: 10px; font-weight: 800; }
-  .message-attachment span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+  .message-attachment-copy { min-width: 0; display: grid; gap: 1px; text-align: left; }
+  .message-attachment-copy strong, .message-attachment-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .message-attachment-copy strong { color: inherit; font-size: 11px; font-weight: 650; }
+  .message-attachment-copy span { font-size: 10px; }
   .reply-reference { max-width: 88%; margin: -1px 5px 6px; color: var(--faint); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .reply-images { width: min(88%, 310px); display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 7px; margin-top: 7px; }
+  .reply-images { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 7px; margin-top: 8px; }
   .reply-image-card { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 12px; padding: 0; background: var(--raised); color: var(--text); text-align: left; cursor: zoom-in; box-shadow: 0 2px 7px rgb(24 22 18 / .04); }
   .reply-image-card:hover { border-color: color-mix(in srgb, var(--accent) 44%, var(--line)); }
   .reply-image-media { height: 112px; display: grid; place-items: center; overflow: hidden; background: var(--soft); color: var(--faint); font-size: 10px; }
   .reply-image-media img { width: 100%; height: 100%; display: block; object-fit: cover; }
   .reply-image-media img:not([src]) { visibility: hidden; }
   .reply-image-name { display: block; overflow: hidden; padding: 7px 8px; color: var(--muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+
+  .agent-activity .bubble { padding: 12px 14px; }
+  .activity-dots { height: 8px; display: flex; align-items: center; gap: 4px; }
+  .activity-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--muted); animation: agentnudge-pulse 1.15s ease-in-out infinite; }
+  .activity-dot:nth-child(2) { animation-delay: 140ms; }
+  .activity-dot:nth-child(3) { animation-delay: 280ms; }
+  @keyframes agentnudge-pulse {
+    0%, 70%, 100% { opacity: .3; transform: translateY(0); }
+    35% { opacity: 1; transform: translateY(-2px); }
+  }
 
   .image-viewer { position: fixed; z-index: 8; inset: 0; display: grid; place-items: center; padding: 28px; background: rgb(18 17 15 / .78); opacity: 0; pointer-events: none; transition: opacity 150ms ease; }
   .image-viewer[data-open="true"] { opacity: 1; pointer-events: auto; }
@@ -284,6 +319,7 @@ const css = String.raw`
 
   @media (prefers-reduced-motion: reduce) {
     .launcher, .sidebar, .capture-rail { transition-duration: 1ms; }
+    .activity-dot { animation: none; opacity: .65; }
   }
 `;
 
@@ -292,6 +328,9 @@ class AgentNudgeWidget extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this.opened = false;
+    this.reviewOpen = false;
+    this.reviewSent = false;
+    this.reviewSentTimer = null;
     this.mode = "idle";
     this.messages = [];
     this.cursor = 0;
@@ -311,6 +350,7 @@ class AgentNudgeWidget extends HTMLElement {
     this.dictationAbort = null;
     this.microphoneCapture = null;
     this.recordingTimer = null;
+    this.awaitingAgent = false;
     this.ending = false;
     this.sessionEnded = false;
     this.endArmed = false;
@@ -324,11 +364,12 @@ class AgentNudgeWidget extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>${css}</style>
       <div class="shell" data-open="false" data-capturing="false">
-        <button class="launcher" type="button" aria-label="Open AgentNudge chat" title="Open chat">${iconMessage}</button>
+        <button class="launcher" type="button" aria-label="Open comments toolbar" title="Open comments toolbar">${iconMessage}</button>
         <aside class="sidebar" aria-label="AgentNudge chat">
           <header class="header">
             <div class="brand-mark">${iconMessage}</div>
             <div class="brand"><strong>AgentNudge</strong><span class="connection">Connected locally</span></div>
+            ${iconButtonMarkup("open-review", "Comments mode", iconNote)}
             ${iconButtonMarkup("end-session", "End session", iconDoorExit)}
             ${iconButtonMarkup("close", "Close chat", iconX)}
           </header>
@@ -368,6 +409,7 @@ class AgentNudgeWidget extends HTMLElement {
       </div>
     `;
     this.shell = this.shadowRoot.querySelector(".shell");
+    this.launcher = this.shadowRoot.querySelector(".launcher");
     this.sidebar = this.shadowRoot.querySelector(".sidebar");
     this.messagesNode = this.shadowRoot.querySelector(".messages");
     this.textarea = this.shadowRoot.querySelector("textarea");
@@ -387,8 +429,9 @@ class AgentNudgeWidget extends HTMLElement {
 
   connectedCallback() {
     const { signal } = this.abort;
-    this.shadowRoot.querySelector(".launcher").addEventListener("click", () => this.open(), { signal });
+    this.launcher.addEventListener("click", () => this.openReview(), { signal });
     this.shadowRoot.querySelector(".close").addEventListener("click", () => this.close(), { signal });
+    this.shadowRoot.querySelector(".open-review").addEventListener("click", () => this.openReview(), { signal });
     this.endSessionButton.addEventListener("click", () => this.endSession(), { signal });
     this.shadowRoot.querySelector(".attach-element").addEventListener("click", () => this.startCapture("element"), { signal });
     this.shadowRoot.querySelector(".attach-region").addEventListener("click", () => this.startCapture("region"), { signal });
@@ -410,6 +453,23 @@ class AgentNudgeWidget extends HTMLElement {
     document.addEventListener("pointercancel", (event) => this.onPointerUp(event), { capture: true, signal });
     document.addEventListener("click", (event) => this.onDocumentClick(event), { capture: true, signal });
     document.addEventListener("keydown", (event) => this.onGlobalKeyDown(event), { capture: true, signal });
+    document.addEventListener("agentnudge:open-chat", (event) => {
+      if (event.detail?.messageId) this.focusedMessageId = event.detail.messageId;
+      if (event.detail?.awaitingAgent) this.awaitingAgent = true;
+      this.open();
+    }, { signal });
+    document.addEventListener("agentnudge:review-sent", () => {
+      this.reviewOpen = false;
+      this.opened = false;
+      this.reviewSent = true;
+      if (this.reviewSentTimer) clearTimeout(this.reviewSentTimer);
+      this.reviewSentTimer = setTimeout(() => {
+        this.reviewSent = false;
+        this.reviewSentTimer = null;
+        this.renderShell();
+      }, 1800);
+      this.renderShell();
+    }, { signal });
     window.addEventListener("resize", () => this.renderOverlay(), { signal });
     window.addEventListener("scroll", () => this.renderOverlay(), { signal, passive: true });
     this.renderAll();
@@ -426,9 +486,12 @@ class AgentNudgeWidget extends HTMLElement {
     }
     this.replyImageCache.clear();
     if (this.endArmTimer) clearTimeout(this.endArmTimer);
+    if (this.reviewSentTimer) clearTimeout(this.reviewSentTimer);
   }
 
   open() {
+    document.getElementById(REVIEW_HOST_ID)?.close();
+    this.reviewOpen = false;
     this.opened = true;
     this.renderShell();
     queueMicrotask(() => this.textarea.focus());
@@ -440,6 +503,15 @@ class AgentNudgeWidget extends HTMLElement {
     this.opened = false;
     this.focusedMessageId = null;
     this.renderAll();
+  }
+
+  openReview() {
+    if (this.mode !== "idle") this.finishCapture();
+    this.opened = false;
+    this.reviewOpen = true;
+    this.focusedMessageId = null;
+    this.renderAll();
+    document.getElementById(REVIEW_HOST_ID)?.open();
   }
 
   async endSession() {
@@ -475,6 +547,7 @@ class AgentNudgeWidget extends HTMLElement {
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
       this.sessionEnded = true;
+      this.awaitingAgent = false;
       this.pollAbort.abort();
       this.textarea.disabled = true;
       this.textarea.placeholder = "Session ended";
@@ -824,8 +897,9 @@ class AgentNudgeWidget extends HTMLElement {
           const known = new Set(this.messages.map((value) => value.id));
           for (const message of result.messages) if (!known.has(message.id)) this.messages.push(message);
           this.messages.sort((first, second) => first.sequence - second.sequence);
+          this.awaitingAgent = awaitingAgentAfterMessages(this.messages, this.awaitingAgent);
           this.cursor = Math.max(this.cursor, Number(result.cursor) || 0);
-          if (result.messages.some((message) => message.role === "agent")) this.setStatus("");
+          if (!this.awaitingAgent) this.setStatus("");
           this.renderMessages();
           if (nearBottom || this.opened) queueMicrotask(() => { this.messagesNode.scrollTop = this.messagesNode.scrollHeight; });
         }
@@ -946,17 +1020,22 @@ class AgentNudgeWidget extends HTMLElement {
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
       this.focusedMessageId = result.messageId;
+      this.awaitingAgent = true;
       this.textarea.value = "";
       this.draftAttachments = [];
       this.activeDrawingId = null;
       this.undoStack = [];
       this.redoStack = [];
       autoSizeTextarea(this.textarea);
-      this.setStatus("Sent. Waiting for the agent.");
+      this.setStatus("");
       this.renderAll();
-      queueMicrotask(() => this.textarea.focus());
+      queueMicrotask(() => {
+        this.messagesNode.scrollTop = this.messagesNode.scrollHeight;
+        this.textarea.focus();
+      });
     } catch (error) {
       console.error("AgentNudge message failed", error);
+      this.awaitingAgent = false;
       this.setStatus("Message could not be sent.", true);
     } finally {
       this.sending = false;
@@ -976,9 +1055,10 @@ class AgentNudgeWidget extends HTMLElement {
       height: window.innerHeight,
       windowWidth: document.documentElement.scrollWidth,
       windowHeight: document.documentElement.scrollHeight,
-      ignoreElements: (element) => element === this,
+      ignoreElements: (element) => element === this || element.id === REVIEW_HOST_ID,
       onclone: (cloneDocument) => {
         cloneDocument.getElementById(HOST_ID)?.remove();
+        cloneDocument.getElementById(REVIEW_HOST_ID)?.remove();
         for (const input of cloneDocument.querySelectorAll("input")) {
           input.value = "[redacted]";
           input.setAttribute("value", "[redacted]");
@@ -1028,6 +1108,7 @@ class AgentNudgeWidget extends HTMLElement {
         kind: attachment.kind,
         rect: this.resolveAttachmentRect(attachment),
         element: attachment.element ? { ...attachment.element } : null,
+        comment: attachment.comment || null,
         strokes: structuredClone(attachment.strokes),
       })),
       screenshotDataUrl,
@@ -1045,6 +1126,7 @@ class AgentNudgeWidget extends HTMLElement {
   }
 
   visibleAttachments() {
+    if (this.reviewOpen) return [];
     if (this.draftAttachments.length) return this.draftAttachments;
     if (!this.focusedMessageId) return [];
     return this.messages.find((value) => value.id === this.focusedMessageId)?.attachments || [];
@@ -1060,7 +1142,12 @@ class AgentNudgeWidget extends HTMLElement {
 
   renderShell() {
     this.shell.dataset.open = String(this.opened);
+    this.shell.dataset.review = String(this.reviewOpen);
     this.shell.dataset.capturing = String(this.mode !== "idle");
+    this.launcher.dataset.sent = String(this.reviewSent);
+    this.launcher.innerHTML = this.reviewSent ? iconCheck : iconMessage;
+    this.launcher.title = this.reviewSent ? "Feedback sent" : "Open comments toolbar";
+    this.launcher.ariaLabel = this.launcher.title;
     for (const mode of ["element", "region", "drawing"]) {
       const button = this.shadowRoot.querySelector(`.attach-${mode}`);
       button.dataset.active = String(this.mode === mode);
@@ -1105,7 +1192,7 @@ class AgentNudgeWidget extends HTMLElement {
   renderMessages() {
     const oldScroll = this.messagesNode.scrollTop;
     this.messagesNode.replaceChildren();
-    if (!this.messages.length) {
+    if (!this.messages.length && !this.awaitingAgent) {
       const empty = document.createElement("div");
       empty.className = "empty";
       empty.innerHTML = `<div class="empty-mark">${iconMessage}</div><strong>Talk to the agent</strong><p>Ask a question or attach something directly from the page.</p>`;
@@ -1118,10 +1205,24 @@ class AgentNudgeWidget extends HTMLElement {
       article.dataset.messageId = message.id;
       const label = document.createElement("div");
       label.className = "message-label";
-      label.textContent = message.role === "agent" ? "Agent" : "You";
+      label.textContent = messageAuthorLabel(message);
       const bubble = document.createElement("div");
       bubble.className = "bubble";
-      bubble.textContent = message.text || (message.imageAttachments?.length ? "Attached image" : "Attached context");
+      if (message.text) {
+        if (message.role === "agent") {
+          bubble.append(renderMarkdown(document, message.text));
+        } else {
+          const text = document.createElement("div");
+          text.className = "plain-message";
+          text.textContent = message.text;
+          bubble.append(text);
+        }
+      } else if (!message.attachments?.length && !message.imageAttachments?.length) {
+        const text = document.createElement("div");
+        text.className = "plain-message";
+        text.textContent = "Attached context";
+        bubble.append(text);
+      }
       article.append(label);
       if (message.inReplyTo) {
         const target = this.messages.find((value) => value.id === message.inReplyTo);
@@ -1131,26 +1232,14 @@ class AgentNudgeWidget extends HTMLElement {
         if (target?.text) reference.title = truncate(target.text, 120);
         article.append(reference);
       }
-      article.append(bubble);
       if (message.attachments?.length) {
-        const attachments = document.createElement("div");
-        attachments.className = "message-attachments";
-        message.attachments.forEach((attachment, index) => {
-          const button = document.createElement("button");
-          button.type = "button";
-          button.className = "message-attachment";
-          button.dataset.active = String(this.focusedMessageId === message.id);
-          button.title = "Show this attachment on the page";
-          const number = document.createElement("span");
-          number.className = "attachment-number";
-          number.textContent = String(index + 1);
-          const text = document.createElement("span");
-          text.textContent = attachmentLabel(attachment);
-          button.append(number, text);
-          button.addEventListener("click", () => this.focusMessage(message.id));
-          attachments.append(button);
+        const attachments = renderContextAttachments(document, {
+          attachments: message.attachments,
+          focused: this.focusedMessageId === message.id,
+          labelFor: attachmentLabel,
+          onActivate: () => this.focusMessage(message.id),
         });
-        article.append(attachments);
+        bubble.append(attachments);
       }
       if (message.imageAttachments?.length) {
         const images = document.createElement("div");
@@ -1175,8 +1264,31 @@ class AgentNudgeWidget extends HTMLElement {
           images.append(card);
           this.populateReplyImage(attachment, image, loading);
         }
-        article.append(images);
+        bubble.append(images);
       }
+      article.append(bubble);
+      this.messagesNode.append(article);
+    }
+    if (this.awaitingAgent) {
+      const article = document.createElement("article");
+      article.className = "message agent agent-activity";
+      const label = document.createElement("div");
+      label.className = "message-label";
+      label.textContent = "Agent";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.setAttribute("role", "status");
+      bubble.setAttribute("aria-label", "Agent is working");
+      const dots = document.createElement("div");
+      dots.className = "activity-dots";
+      dots.setAttribute("aria-hidden", "true");
+      for (let index = 0; index < 3; index += 1) {
+        const dot = document.createElement("span");
+        dot.className = "activity-dot";
+        dots.append(dot);
+      }
+      bubble.append(dots);
+      article.append(label, bubble);
       this.messagesNode.append(article);
     }
     this.messagesNode.scrollTop = oldScroll;
@@ -1503,7 +1615,10 @@ if (location.origin !== ALLOWED_ORIGIN) {
   console.warn(`AgentNudge refused to start on ${location.origin}; the local session allows ${ALLOWED_ORIGIN}.`);
 } else if (!document.getElementById(HOST_ID)) {
   if (!customElements.get("agent-nudge-widget")) customElements.define("agent-nudge-widget", AgentNudgeWidget);
+  if (!customElements.get("agent-nudge-review")) customElements.define("agent-nudge-review", AgentNudgeReview);
   const widget = document.createElement("agent-nudge-widget");
   widget.id = HOST_ID;
-  document.documentElement.append(widget);
+  const review = document.createElement("agent-nudge-review");
+  review.id = REVIEW_HOST_ID;
+  document.documentElement.append(widget, review);
 }

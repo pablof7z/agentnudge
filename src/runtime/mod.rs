@@ -41,10 +41,32 @@ pub struct RuntimeLaunchConfig {
 #[derive(Clone, Debug)]
 pub struct RuntimeUserMessage {
     pub message_id: String,
+    pub channel: RuntimeMessageChannel,
     pub text: String,
     pub manifest_path: String,
     pub screenshot_path: String,
     pub attachment_summaries: Vec<String>,
+}
+
+impl RuntimeUserMessage {
+    fn reply_target(&self) -> RuntimeReplyTarget {
+        RuntimeReplyTarget {
+            message_id: self.message_id.clone(),
+            channel: self.channel.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeMessageChannel {
+    Chat,
+    ReviewThread(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeReplyTarget {
+    pub message_id: String,
+    pub channel: RuntimeMessageChannel,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -62,8 +84,14 @@ pub struct RuntimeSnapshot {
 
 #[derive(Debug)]
 pub enum RuntimeEvent {
-    AssistantMessage(String),
-    Error(String),
+    AssistantMessage {
+        message: String,
+        target: Option<RuntimeReplyTarget>,
+    },
+    Error {
+        message: String,
+        target: Option<RuntimeReplyTarget>,
+    },
 }
 
 enum RuntimeCommand {

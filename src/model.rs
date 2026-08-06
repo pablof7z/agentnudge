@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-pub const PROTOCOL_VERSION: u8 = 12;
+pub const PROTOCOL_VERSION: u8 = 13;
 pub const MAX_MESSAGE_CHARS: usize = 10_000;
+pub const MAX_ATTACHMENT_COMMENT_CHARS: usize = 5_000;
 pub const MAX_ATTACHMENTS: usize = 100;
 pub const MAX_DRAWING_STROKES: usize = 500;
 pub const MAX_DRAWING_POINTS: usize = 50_000;
@@ -53,6 +54,8 @@ pub struct ContextAttachment {
     pub kind: AttachmentKind,
     pub rect: Option<Rect>,
     pub element: Option<ElementContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
     #[serde(default)]
     pub strokes: Vec<DrawingStroke>,
 }
@@ -115,6 +118,8 @@ pub struct ChatMessage {
     pub text: String,
     pub created_at_unix_ms: u128,
     pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_thread_id: Option<String>,
     #[serde(default)]
     pub attachments: Vec<ContextAttachment>,
     #[serde(default)]
@@ -125,6 +130,15 @@ pub struct ChatMessage {
 #[serde(rename_all = "camelCase")]
 pub struct ConversationResponse {
     pub version: u8,
+    pub messages: Vec<ChatMessage>,
+    pub cursor: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewConversationResponse {
+    pub version: u8,
+    pub thread_id: String,
     pub messages: Vec<ChatMessage>,
     pub cursor: u64,
 }
@@ -368,6 +382,20 @@ impl ChatSubmission {
             if attachment.id.is_empty() || !attachment_ids.insert(attachment.id.clone()) {
                 return Err("every attachment needs a unique non-empty id".into());
             }
+            attachment.comment = attachment
+                .comment
+                .take()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            if attachment
+                .comment
+                .as_ref()
+                .is_some_and(|value| value.chars().count() > MAX_ATTACHMENT_COMMENT_CHARS)
+            {
+                return Err(format!(
+                    "an attachment comment exceeds the {MAX_ATTACHMENT_COMMENT_CHARS}-character limit"
+                ));
+            }
 
             match attachment.kind {
                 AttachmentKind::Element => {
@@ -452,7 +480,7 @@ impl ChatSubmission {
 
 impl ContextAttachment {
     pub fn summary(&self) -> String {
-        match self.kind {
+        let target = match self.kind {
             AttachmentKind::Element => self.element.as_ref().map_or_else(
                 || "element".into(),
                 |element| {
@@ -483,6 +511,10 @@ impl ContextAttachment {
                 self.strokes.len(),
                 if self.strokes.len() == 1 { "" } else { "s" }
             ),
+        };
+        match self.comment.as_deref() {
+            Some(comment) => format!("{target}; comment: {comment}"),
+            None => target,
         }
     }
 
@@ -670,6 +702,7 @@ mod tests {
                     text: Some("Save".into()),
                     selector: "#save".into(),
                 }),
+                comment: None,
                 strokes: vec![],
             }],
             screenshot_data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
@@ -711,6 +744,17 @@ mod tests {
     fn summarizes_element_context_for_the_agent() {
         let value = submission().validate_and_sanitize("session").unwrap();
         assert_eq!(value.attachments[0].summary(), "button \"Save\" (#save)");
+    }
+
+    #[test]
+    fn preserves_a_sticky_comment_in_the_agent_summary() {
+        let mut value = submission();
+        value.attachments[0].comment = Some("  Move this below the form  ".into());
+        let value = value.validate_and_sanitize("session").unwrap();
+        assert_eq!(
+            value.attachments[0].summary(),
+            "button \"Save\" (#save); comment: Move this below the form"
+        );
     }
 
     #[test]

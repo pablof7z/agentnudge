@@ -1,8 +1,10 @@
 # AgentNudge
 
-AgentNudge is a tiny local chat bridge between a person looking at software and the coding agent working on it.
+AgentNudge is a tiny local visual-feedback bridge between a person looking at software and the coding agent working on it.
 
-A development-only message button opens a sidebar directly in the website. You can ask the agent a question or request a change, and attach page elements, rectangular regions, or freehand drawings to the message. AgentNudge can wake the current harness through a foreground wait, or route the conversation through a per-session Codex or Claude runtime whose replies appear directly in the sidebar.
+A development-only message button opens a toolbar directly in the website. Comments mode supports a review pass with grouped elements, areas, drawings, draggable notes, undo/redo, and one batch send. Each group can either be staged as feedback or sent as an inline question to the session's Codex or Claude runtime; its answer stays in that floating thread and the complete discussion is included in the eventual batch. The batch wakes the main harness through its foreground wait without entering chat. The separate Chat mode supports free-form questions and change requests with page context attached to individual messages.
+
+Unsent review threads are kept in the local broker and restored after a page reload; the widget does not use browser storage. Sending the batch clears that draft only after the broker accepts the main-agent handoff.
 
 The local/manual bridge needs no account, hosted service, browser extension, or multi-computer transport. Embedded modes use the machine's existing Codex or Claude authentication.
 
@@ -36,7 +38,7 @@ agentnudge session \
 
 Claude mode launches the pinned `@agentclientprotocol/claude-agent-acp` package through `npx` and reuses the local Claude login. Pass `--runtime-bin /path/to/claude-agent-acp` to use an already-installed adapter instead.
 
-The command prints the ready record, then remains in the foreground. Keep its process handle. Each browser message is sent to the session's private runtime conversation. Codex uses `turn/steer` while active. Claude follows standard ACP and queues a new `session/prompt` until the current prompt completes. Completed agent messages appear in the sidebar.
+The command prints the ready record, then remains in the foreground. Keep its process handle. Chat-mode messages and inline questions from Comments mode share the session's private runtime conversation, but replies return only to the surface that asked. Codex uses `turn/steer` while active. Claude follows standard ACP and queues a new `session/prompt` until the current prompt completes. Comments-mode batch feedback bypasses that runtime and wakes the main harness instead.
 
 The trusted `--context` (or `--context-file`) is applied at Codex `thread/start` or appended to Claude Code's system prompt at ACP `session/new`. Browser messages, captures, manifests, and page text stay untrusted user input. The annotated screenshot is supplied as an image along with its evidence paths.
 
@@ -64,7 +66,7 @@ The command prints stable JSON, then remains in the foreground until the session
 
 ```json
 {
-  "version": 12,
+  "version": 13,
   "status": "ready",
   "session": "lima",
   "widgetUrl": "http://127.0.0.1:4317/lima/widget.js",
@@ -85,11 +87,11 @@ Sending a browser message completes the wait with JSON containing the message an
 
 ```json
 {
-  "version": 12,
+  "version": 13,
   "status": "message",
   "session": "lima",
   "message": {
-    "version": 12,
+    "version": 13,
     "sessionId": "lima",
     "messageId": "…",
     "sequence": 1,
@@ -140,7 +142,7 @@ agentnudge reply lima 0s \
 A wait without a message is a normal successful result:
 
 ```json
-{"version":12,"status":"timeout","session":"lima","waitedMs":600000}
+{"version":13,"status":"timeout","session":"lima","waitedMs":600000}
 ```
 
 Call `wait` again after a timeout. End the conversation explicitly when it is finished:
@@ -236,7 +238,9 @@ If the returned session is `lima`, open:
 http://localhost:5173/?agentnudge=lima
 ```
 
-Click the small message icon. Write directly in the sidebar. The pointer attaches an element, the dashed square attaches a rectangular area, and the pencil lets you draw on the page. Every attachment appears as a numbered chip beside the composer and as the matching numbered mark on the page. Press Enter or the coral send button to send everything as one chat message.
+Click the small launcher to enter Comments mode by default. Its compact icon toolbar restores the page-review workflow: select a drawing, add a draggable sticky note anywhere or against an element/dragged region, draw freehand, mark an area, open a page-level comment, undo/redo, or delete selected ink. Double-click saved sticky text to edit it. The coral send button submits the page comment, every sticky, every mark, and the composited screenshot together, then returns to Chat mode.
+
+Press the chat-bubble icon at the start of the Comments toolbar to open Chat mode. Write directly in the sidebar. The pointer attaches an element, the dashed square attaches a rectangular area, and the pencil lets you draw on the page. Every attachment appears inside its message bubble and as the matching numbered mark on the page. Press Enter or the coral send button to send one chat message. The note icon in the chat header returns to Comments mode.
 
 In the agent terminal, wait for it:
 
@@ -262,9 +266,10 @@ Every user message can contain:
 - A sanitized page URL with query and fragment removed.
 - Viewport and scroll coordinates.
 - Any number of numbered element, region, and drawing attachments.
+- Optional sticky-note text attached to a specific element or region.
 - Element metadata: tag, role, accessible name, bounded text, classes, selector, and visible rectangle.
 - Bounded freehand point sequences.
-- An annotated screenshot containing the selected regions, drawings, and matching attachment numbers.
+- An annotated screenshot containing the selected regions, drawings, matching attachment numbers, and Comments-mode sticky cards.
 
 Clicking an attachment in a sent sidebar message shows its marks on the page again. Old marks otherwise stay hidden so the website does not become cluttered.
 
