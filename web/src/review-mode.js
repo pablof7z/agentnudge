@@ -1,5 +1,5 @@
 import html2canvas from "html2canvas";
-import { pointInClosedPath } from "./annotation-geometry.js";
+import { placeFloatingRect, pointInClosedPath } from "./annotation-geometry.js";
 import { renderMarkdown } from "./markdown.js";
 import { paintReviewMarks } from "./review-capture.js";
 import {
@@ -8,6 +8,7 @@ import {
   beginThreadQuestion,
   createReviewThread,
   drawingBounds,
+  latestAgentReplyPreview,
   referenceLabel,
   reviewDraftUrl,
   reviewThreadConversationUrl,
@@ -17,7 +18,9 @@ import {
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
+import iconChevronRight from "@tabler/icons/outline/chevron-right.svg";
 import iconGrip from "@tabler/icons/outline/grip-horizontal.svg";
+import iconLoader from "@tabler/icons/outline/loader-2.svg";
 import iconComment from "@tabler/icons/outline/message-plus.svg";
 import iconMessage from "@tabler/icons/outline/message-dots.svg";
 import iconNote from "@tabler/icons/outline/note.svg";
@@ -153,6 +156,7 @@ const css = String.raw`
     transition: transform 130ms ease, border-color 130ms ease, opacity 130ms ease;
   }
   .pending-thread:hover { transform: translateY(-1px); border-color: var(--item-color); }
+  .pending-thread.has-reply { min-height: 55px; border-color: color-mix(in srgb, var(--item-color) 42%, var(--border)); }
   .pending-badge, .thread-number {
     display: grid;
     place-items: center;
@@ -166,8 +170,11 @@ const css = String.raw`
   .pending-copy strong, .pending-copy span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pending-copy strong { font-size: 11px; font-weight: 680; }
   .pending-copy span { color: var(--muted); font-size: 9px; }
+  .pending-thread.has-reply .pending-copy span { color: color-mix(in srgb, var(--text) 78%, var(--muted)); }
   .pending-state { width: 18px; display: grid; place-items: center; color: var(--item-color); }
   .pending-state svg { width: 15px; height: 15px; }
+  .pending-state.is-working svg { animation: pending-spin .85s linear infinite; }
+  @keyframes pending-spin { to { transform: rotate(360deg); } }
 
   .thread-layer { position: fixed; inset: 0; z-index: 4; pointer-events: none; }
   .thread-card {
@@ -281,6 +288,7 @@ const css = String.raw`
   @media (prefers-reduced-motion: reduce) {
     .icon-button, .send-review, .pending-thread { transition: none; }
     .thread-working span { animation: none; opacity: .65; }
+    .pending-state.is-working svg { animation: none; }
   }
 `;
 
@@ -654,7 +662,13 @@ export class AgentNudgeReview extends HTMLElement {
       this.currentStroke = null;
       this.currentStrokeThreadId = null;
       this.revealThreadAfterStroke = false;
-      if (revealThread && this.threads.some((thread) => thread.id === threadId)) {
+      const thread = this.threads.find((value) => value.id === threadId);
+      if (revealThread && thread) {
+        const drawing = thread.references.find((reference) => reference.kind === "drawing");
+        if (drawing) {
+          drawing.rect = drawingBounds(drawing.strokes);
+          thread.cardPosition = placeThreadCard(point, drawing.rect);
+        }
         this.activeThreadId = threadId;
         this.highlightedThreadId = threadId;
       }
@@ -1234,7 +1248,11 @@ export class AgentNudgeReview extends HTMLElement {
         button.type = "button";
         button.className = "pending-thread";
         button.style.setProperty("--item-color", thread.color);
-        button.ariaLabel = `Open feedback thread ${thread.number}`;
+        const replyPreview = latestAgentReplyPreview(thread);
+        if (replyPreview) button.classList.add("has-reply");
+        button.ariaLabel = replyPreview
+          ? `Open feedback thread ${thread.number}. Agent replied: ${replyPreview}`
+          : `Open feedback thread ${thread.number}`;
         const badge = document.createElement("span");
         badge.className = "pending-badge";
         badge.textContent = String(thread.number);
@@ -1243,12 +1261,16 @@ export class AgentNudgeReview extends HTMLElement {
         const title = document.createElement("strong");
         title.textContent = threadDisplayText(thread);
         const meta = document.createElement("span");
-        const replies = thread.conversation.filter((message) => message.role === "agent").length;
-        meta.textContent = `${thread.references.length} mark${thread.references.length === 1 ? "" : "s"}${replies ? ` · ${replies} repl${replies === 1 ? "y" : "ies"}` : ""}`;
+        meta.textContent = thread.asking
+          ? "Agent is replying…"
+          : replyPreview
+            ? `Agent · ${replyPreview}`
+            : `${thread.references.length} mark${thread.references.length === 1 ? "" : "s"}`;
         copy.append(title, meta);
         const state = document.createElement("span");
         state.className = "pending-state";
-        state.innerHTML = thread.asking ? workingDotsMarkup() : iconCheck;
+        state.innerHTML = thread.asking ? iconLoader : replyPreview ? iconChevronRight : iconCheck;
+        if (thread.asking) state.classList.add("is-working");
         button.append(badge, copy, state);
         button.addEventListener("click", () => this.reopenThread(thread.id));
         button.addEventListener("mouseenter", () => {
@@ -1606,10 +1628,13 @@ function strokePath(points) {
 
 function placeThreadCard(point, rect) {
   const width = Math.min(292, window.innerWidth - 24);
-  const anchorX = rect ? rect.x + rect.width : point.x;
-  let x = anchorX + 16;
-  if (x + width > window.innerWidth - 12) x = (rect ? rect.x : point.x) - width - 16;
-  return clampCardPosition({ x, y: rect ? rect.y : point.y });
+  const height = Math.min(220, window.innerHeight * .7, window.innerHeight - 24);
+  return placeFloatingRect({
+    anchor: point,
+    exclusionRect: rect,
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    floatingSize: { width, height },
+  });
 }
 
 function clampCardPosition(position) {

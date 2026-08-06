@@ -37,6 +37,19 @@ export function threadDisplayText(thread) {
   return latestUserMessage || "Marked context";
 }
 
+export function latestAgentReplyPreview(thread) {
+  const reply = [...thread.conversation]
+    .reverse()
+    .find((message) => message.role === "agent")?.text;
+  if (typeof reply !== "string") return "";
+  return reply
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/[*_~`>#]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function buildGroupedReviewPayload({ sessionId, threads, page, screenshotDataUrl }) {
   return {
     sessionId,

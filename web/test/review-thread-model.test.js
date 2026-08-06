@@ -7,6 +7,7 @@ import {
   beginThreadQuestion,
   createReviewThread,
   groupedReviewAttachments,
+  latestAgentReplyPreview,
   referenceLabel,
   reviewDraftUrl,
   reviewThreadConversationUrl,
@@ -105,6 +106,13 @@ test("moves an asked thread into the pending stack while the agent runs", () => 
   assert.equal(value.pending, true);
   assert.equal(value.draft, "");
   assert.deepEqual(message.referenceIds, ["1A"]);
+});
+
+test("builds a compact one-line agent reply preview", () => {
+  const value = thread();
+  value.conversation.push({ role: "agent", text: "First line\n\nSecond **line**" });
+
+  assert.equal(latestAgentReplyPreview(value), "First line Second line");
 });
 
 test("scopes review conversation URLs to one encoded thread", () => {

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { pointInClosedPath, rectanglePoints } from "../src/annotation-geometry.js";
+import { placeFloatingRect, pointInClosedPath, rectanglePoints } from "../src/annotation-geometry.js";
 import { paintCommentReview, paintMessageAttachments } from "../src/annotation-overlay.js";
 
 test("turns an area drag into a closed rectangle path", () => {
@@ -15,6 +15,29 @@ test("turns an area drag into a closed rectangle path", () => {
   ]);
   assert.equal(pointInClosedPath({ x: 60, y: 50 }, points), true);
   assert.equal(pointInClosedPath({ x: 160, y: 50 }, points), false);
+});
+
+test("places a comment below a drawing when neither horizontal side fits", () => {
+  const drawing = { x: 72, y: 30, width: 260, height: 160 };
+  const position = placeFloatingRect({
+    anchor: { x: 332, y: 190 },
+    exclusionRect: drawing,
+    viewport: { width: 500, height: 600 },
+    floatingSize: { width: 292, height: 220 },
+  });
+
+  assert.deepEqual(position, { x: 72, y: 206 });
+});
+
+test("keeps the preferred right-side placement when it fits", () => {
+  const position = placeFloatingRect({
+    anchor: { x: 200, y: 180 },
+    exclusionRect: { x: 100, y: 100, width: 100, height: 80 },
+    viewport: { width: 1_200, height: 800 },
+    floatingSize: { width: 292, height: 220 },
+  });
+
+  assert.deepEqual(position, { x: 216, y: 100 });
 });
 
 test("resets the screenshot transform and paints numbered attachments", () => {
