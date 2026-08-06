@@ -2,6 +2,7 @@ import html2canvas from "html2canvas";
 import { placeFloatingRect, pointInClosedPath } from "./annotation-geometry.js";
 import { renderMarkdown } from "./markdown.js";
 import { paintReviewMarks } from "./review-capture.js";
+import { createUserInput, userInputStyles } from "./user-input.js";
 import {
   buildGroupedReviewPayload,
   buildThreadQuestionPayload,
@@ -40,6 +41,7 @@ const INK_WIDTH = 4;
 const MAX_HISTORY = 80;
 
 const css = String.raw`
+  ${userInputStyles}
   :host {
     --surface: #fbfaf6;
     --raised: #fffefa;
@@ -252,25 +254,21 @@ const css = String.raw`
   .thread-working span:nth-child(3) { animation-delay: 260ms; }
   @keyframes thread-pulse { 0%, 70%, 100% { opacity: .28; transform: translateY(0); } 35% { opacity: 1; transform: translateY(-2px); } }
 
-  .thread-composer { padding: 7px 8px 8px; }
-  .thread-composer textarea {
-    display: block;
-    width: 100%;
-    height: 58px;
-    min-height: 58px;
-    max-height: 180px;
-    resize: none;
-    overflow: hidden;
-    border: 0;
-    border-radius: 9px;
-    padding: 9px 10px;
-    background: var(--hover);
-    color: var(--text);
-    font-size: 12px;
-    line-height: 1.45;
+  .thread-composer {
+    --user-input-min-height: 58px;
+    --user-input-radius: 9px;
+    --user-input-padding: 9px 10px;
+    --user-input-background: var(--hover);
+    --user-input-color: var(--text);
+    --user-input-placeholder: var(--muted);
+    --user-input-font-size: 12px;
+    --user-input-focus: color-mix(in srgb, var(--thread-color) 72%, transparent);
+    --user-input-dictation-background: color-mix(in srgb, var(--thread-color) 13%, transparent);
+    --user-input-dictation-color: var(--thread-color);
+    --user-input-dictation-ring: color-mix(in srgb, var(--thread-color) 16%, transparent);
+    padding: 7px 8px 8px;
   }
-  .thread-composer textarea::placeholder { color: var(--muted); }
-  .thread-actions { display: flex; align-items: center; gap: 5px; margin-top: 6px; }
+  .thread-composer .user-input-actions { min-height: 37px; padding: 6px 0 0; }
   .thread-meta { min-width: 0; flex: 1; color: var(--muted); font-size: 9px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ask-thread, .queue-thread { width: 31px; height: 31px; }
   .ask-thread { color: var(--thread-color); }
@@ -316,6 +314,7 @@ export class AgentNudgeReview extends HTMLElement {
     this.movingCard = false;
     this.sending = false;
     this.threadPolls = new Map();
+    this.activeUserInput = null;
     this.restoreComplete = false;
     this.localEdits = false;
     this.persistTimer = null;
@@ -392,6 +391,8 @@ export class AgentNudgeReview extends HTMLElement {
     if (this.persistTimer) clearTimeout(this.persistTimer);
     this.abort.abort();
     this.threadPolls.clear();
+    this.activeUserInput?.destroy();
+    this.activeUserInput = null;
   }
 
   async restoreDraft() {
@@ -1194,10 +1195,7 @@ export class AgentNudgeReview extends HTMLElement {
 
   focusComposer(select = true) {
     queueMicrotask(() => {
-      const textarea = this.threadLayer.querySelector("textarea");
-      if (!textarea) return;
-      textarea.focus({ preventScroll: true });
-      if (select) textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+      this.activeUserInput?.focus({ preventScroll: true, selectEnd: select });
     });
   }
 
@@ -1279,6 +1277,8 @@ export class AgentNudgeReview extends HTMLElement {
   }
 
   renderActiveThread() {
+    this.activeUserInput?.destroy();
+    this.activeUserInput = null;
     const thread = this.activeThread();
     if (!thread) {
       this.threadLayer.replaceChildren();
@@ -1367,31 +1367,6 @@ export class AgentNudgeReview extends HTMLElement {
       transcript.append(working);
     }
 
-    const composer = document.createElement("div");
-    composer.className = "thread-composer";
-    const textarea = document.createElement("textarea");
-    textarea.maxLength = 5000;
-    textarea.value = thread.draft;
-    textarea.placeholder = thread.conversation.length
-      ? "Reply or write the final feedback…"
-      : RUNTIME_ENABLED
-        ? "Write feedback or ask the agent…"
-        : "Write feedback…";
-    textarea.setAttribute("aria-label", `Feedback thread ${thread.number}`);
-    textarea.addEventListener("input", () => {
-      thread.draft = textarea.value;
-      autoSizeTextarea(textarea);
-      ask.disabled = !RUNTIME_ENABLED || thread.asking || !thread.draft.trim();
-      meta.textContent = thread.draft.trim() ? "Ready to ask or add to review" : `${thread.references.length} grouped mark${thread.references.length === 1 ? "" : "s"}`;
-    });
-    textarea.addEventListener("keydown", (event) => {
-      if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-        event.preventDefault();
-        this.askThread(thread.id);
-      }
-    });
-    const actions = document.createElement("div");
-    actions.className = "thread-actions";
     const meta = document.createElement("span");
     meta.className = "thread-meta";
     meta.textContent = `${thread.references.length} grouped mark${thread.references.length === 1 ? "" : "s"}`;
@@ -1404,12 +1379,43 @@ export class AgentNudgeReview extends HTMLElement {
     ask.addEventListener("click", () => this.askThread(thread.id));
     const queue = iconButton("Add to review", iconCheck, "thread-icon queue-thread");
     queue.addEventListener("click", () => this.collapseThread(thread.id));
-    actions.append(meta, ask, queue);
-    composer.append(textarea, actions);
+    const userInput = createUserInput({
+      document,
+      endpoint: ENDPOINT,
+      browserToken: BROWSER_TOKEN,
+      ariaLabel: `Feedback thread ${thread.number}`,
+      placeholder: thread.conversation.length
+        ? "Reply or write the final feedback…"
+        : RUNTIME_ENABLED
+          ? "Write feedback or ask the agent…"
+          : "Write feedback…",
+      value: thread.draft,
+      maxLength: 5000,
+      minHeight: 58,
+      maxHeight: () => Math.min(180, window.innerHeight * .34),
+      submit: "modifier-enter",
+      onChange: (value, input) => {
+        thread.draft = value;
+        ask.disabled = !RUNTIME_ENABLED || thread.asking || input.busy || !thread.draft.trim();
+        meta.textContent = thread.draft.trim()
+          ? "Ready to ask or add to review"
+          : `${thread.references.length} grouped mark${thread.references.length === 1 ? "" : "s"}`;
+      },
+      onSubmit: () => this.askThread(thread.id),
+      onStatus: (message) => this.setStatus(message),
+      onStateChange: (input) => {
+        ask.disabled = !RUNTIME_ENABLED || thread.asking || input.busy || !thread.draft.trim();
+        queue.disabled = input.busy;
+      },
+    });
+    userInput.element.classList.add("thread-composer");
+    userInput.leadingActions.append(meta);
+    userInput.trailingActions.append(ask, queue);
+    this.activeUserInput = userInput;
+    const composer = userInput.element;
     body.append(transcript, composer);
     card.append(accent, head, references, body);
     this.threadLayer.replaceChildren(card);
-    queueMicrotask(() => autoSizeTextarea(textarea));
     queueMicrotask(() => { body.scrollTop = body.scrollHeight; });
   }
 
@@ -1653,14 +1659,6 @@ function pointToSegmentDistance(point, start, end) {
   if (dx === 0 && dy === 0) return pointDistance(point, start);
   const amount = Math.max(0, Math.min(1, ((point.x - start.x) * dx + (point.y - start.y) * dy) / (dx * dx + dy * dy)));
   return pointDistance(point, { x: start.x + amount * dx, y: start.y + amount * dy });
-}
-
-function autoSizeTextarea(textarea) {
-  const maximum = Math.min(180, window.innerHeight * .34);
-  textarea.style.height = "58px";
-  const height = Math.min(maximum, Math.max(58, textarea.scrollHeight));
-  textarea.style.height = `${height}px`;
-  textarea.style.overflowY = textarea.scrollHeight > maximum ? "auto" : "hidden";
 }
 
 function colorWithAlpha(color, alpha) {
