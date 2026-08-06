@@ -26,7 +26,6 @@ import iconMessage from "@tabler/icons/outline/message-dots.svg";
 import iconNote from "@tabler/icons/outline/note.svg";
 import iconPencil from "@tabler/icons/outline/pencil.svg";
 import iconPointer from "@tabler/icons/outline/pointer.svg";
-import iconRectangle from "@tabler/icons/outline/square-dashed.svg";
 import iconSend from "@tabler/icons/outline/send.svg";
 import iconTrash from "@tabler/icons/outline/trash.svg";
 import iconX from "@tabler/icons/outline/x.svg";
@@ -336,7 +335,6 @@ export class AgentNudgeReview extends HTMLElement {
               ${iconButtonMarkup("select-mode", "Select drawing", iconPointer)}
               ${iconButtonMarkup("target-mode", "Mark an element or area", iconNote)}
               ${iconButtonMarkup("draw-mode", "Draw into active feedback", iconPencil)}
-              ${iconButtonMarkup("region-mode", "Mark an area", iconRectangle)}
               ${iconButtonMarkup("page-note", "New page note", iconComment)}
               <span class="separator" aria-hidden="true"></span>
               ${iconButtonMarkup("undo", "Undo", iconUndo)}
@@ -373,7 +371,6 @@ export class AgentNudgeReview extends HTMLElement {
     this.root.querySelector(".select-mode").addEventListener("click", () => this.setMode("select"), { signal });
     this.root.querySelector(".target-mode").addEventListener("click", () => this.setMode("target"), { signal });
     this.root.querySelector(".draw-mode").addEventListener("click", () => this.setMode("draw"), { signal });
-    this.root.querySelector(".region-mode").addEventListener("click", () => this.setMode("region"), { signal });
     this.root.querySelector(".page-note").addEventListener("click", () => this.createPageNote(), { signal });
     this.root.querySelector(".undo").addEventListener("click", () => this.undo(), { signal });
     this.root.querySelector(".redo").addEventListener("click", () => this.redo(), { signal });
@@ -532,11 +529,12 @@ export class AgentNudgeReview extends HTMLElement {
     if (this.sending) return;
     this.localEdits = true;
     const existing = this.activeThread();
-    if (existing && !existing.asking) {
+    if (existing?.conversation.length) {
+      this.detachConversationalThread();
+    } else if (existing) {
       this.focusComposer();
       return;
     }
-    if (existing?.asking) this.detachAskingThread();
     this.pushUndo();
     const anchor = { x: Math.max(36, window.innerWidth - 330), y: Math.max(36, window.innerHeight - 190) };
     const thread = this.createThread(anchor, null);
@@ -555,8 +553,8 @@ export class AgentNudgeReview extends HTMLElement {
     event.stopImmediatePropagation();
     this.suppressNextClick = true;
 
-    if (this.activeThread()?.asking && ["draw", "target", "region"].includes(this.mode)) {
-      this.detachAskingThread();
+    if (this.activeThread()?.conversation.length && ["draw", "target"].includes(this.mode)) {
+      this.detachConversationalThread();
     }
 
     if (this.mode === "select") {
@@ -604,14 +602,12 @@ export class AgentNudgeReview extends HTMLElement {
       return;
     }
 
-    if (this.mode === "target" || this.mode === "region") {
+    if (this.mode === "target") {
       this.dragStart = point;
       this.pointerTarget = target;
       this.pendingRect = null;
-      if (this.mode === "target") {
-        const meaningful = meaningfulTarget(target);
-        this.hoverRect = meaningful ? plainRect(meaningful.getBoundingClientRect()) : null;
-      }
+      const meaningful = meaningfulTarget(target);
+      this.hoverRect = meaningful ? plainRect(meaningful.getBoundingClientRect()) : null;
       this.renderGuides();
     }
   }
@@ -631,7 +627,7 @@ export class AgentNudgeReview extends HTMLElement {
       }
       return;
     }
-    if ((this.mode === "target" || this.mode === "region") && this.dragStart) {
+    if (this.mode === "target" && this.dragStart) {
       event.preventDefault();
       if (pointDistance(point, this.dragStart) >= 6) {
         this.hoverRect = null;
@@ -676,13 +672,13 @@ export class AgentNudgeReview extends HTMLElement {
       this.focusComposer(false);
       return;
     }
-    if ((this.mode === "target" || this.mode === "region") && this.dragStart) {
+    if (this.mode === "target" && this.dragStart) {
       event.preventDefault();
       event.stopImmediatePropagation();
       const dragged = this.pendingRect && this.pendingRect.width >= 6 && this.pendingRect.height >= 6;
       if (dragged) {
         this.addReference({ kind: "region", rect: { ...this.pendingRect }, element: null, strokes: [] }, point);
-      } else if (this.mode === "target") {
+      } else {
         const element = meaningfulTarget(this.pointerTarget);
         if (element) this.addElementReference(element, point);
         else if (!this.activeThread()) this.createPageNoteAt(point);
@@ -774,9 +770,9 @@ export class AgentNudgeReview extends HTMLElement {
     return this.threads.find((thread) => thread.id === this.activeThreadId) || null;
   }
 
-  detachAskingThread() {
+  detachConversationalThread() {
     const thread = this.activeThread();
-    if (!thread?.asking) return;
+    if (!thread?.conversation.length) return;
     thread.pending = true;
     this.activeThreadId = null;
     this.highlightedThreadId = null;
@@ -793,10 +789,6 @@ export class AgentNudgeReview extends HTMLElement {
     }
     const userMessage = beginThreadQuestion(thread, message);
     const captureThreads = [structuredClone(thread)];
-    if (this.activeThreadId === thread.id) {
-      this.activeThreadId = null;
-      this.highlightedThreadId = null;
-    }
     this.render();
     this.setStatus("Capturing context for the embedded agent.");
     let accepted = false;
@@ -1217,7 +1209,7 @@ export class AgentNudgeReview extends HTMLElement {
   render() {
     const active = this.activeThread();
     this.style.setProperty("--thread-color", active?.color || "#df5b39");
-    for (const mode of ["select", "target", "draw", "region"]) {
+    for (const mode of ["select", "target", "draw"]) {
       const button = this.root.querySelector(`.${mode}-mode`);
       button.dataset.active = String(this.mode === mode);
       button.setAttribute("aria-pressed", String(this.mode === mode));

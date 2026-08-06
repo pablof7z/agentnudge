@@ -1133,6 +1133,7 @@ async fn record_agent_reply(
             text: submission.message,
             created_at_unix_ms,
             in_reply_to: submission.in_reply_to,
+            review_thread_id: None,
             attachments: vec![],
             image_attachments: persisted.metadata,
         });
@@ -1156,30 +1157,45 @@ async fn record_review_reply(
 ) -> Result<ReplyReceipt> {
     let created_at_unix_ms = unix_time_ms()?;
     let message_id = Uuid::new_v4().to_string();
-    let sequence = {
+    let review_message = {
         let mut review = state.review_conversations.lock().await;
         let conversation = review.entry(thread_id.to_owned()).or_default();
         conversation.next_sequence += 1;
         let sequence = conversation.next_sequence;
-        conversation.messages.push(ChatMessage {
+        let review_message = ChatMessage {
             id: message_id.clone(),
             sequence,
             role: ChatRole::Agent,
             text: message,
             created_at_unix_ms,
             in_reply_to,
+            review_thread_id: Some(thread_id.to_owned()),
             attachments: vec![],
             image_attachments: vec![],
-        });
-        sequence
+        };
+        conversation.messages.push(review_message.clone());
+        review_message
     };
     state.review_notify.notify_waiters();
+    mirror_review_message(state, review_message.clone()).await?;
     Ok(ReplyReceipt {
         version: PROTOCOL_VERSION,
         status: "accepted".into(),
         message_id,
-        sequence,
+        sequence: review_message.sequence,
     })
+}
+
+async fn mirror_review_message(state: &SessionState, mut message: ChatMessage) -> Result<()> {
+    {
+        let mut conversation = state.conversation.lock().await;
+        conversation.next_sequence += 1;
+        message.sequence = conversation.next_sequence;
+        conversation.messages.push(message);
+    }
+    state.transcript_notify.notify_waiters();
+    persist_active_transcript(state).await?;
+    Ok(())
 }
 
 fn prepare_agent_reply(submission: AgentReplySubmission) -> Result<PreparedAgentReply, String> {
@@ -1875,6 +1891,7 @@ async fn submit_browser_message(
             text: submission.text,
             created_at_unix_ms: received_at_unix_ms,
             in_reply_to: None,
+            review_thread_id: None,
             attachments: submission.attachments,
             image_attachments: vec![],
         });
@@ -2008,24 +2025,32 @@ async fn submit_review_message(
             .map(|attachment| attachment.summary.clone())
             .collect(),
     };
+    let review_message = ChatMessage {
+        id: message_id.clone(),
+        sequence,
+        role: ChatRole::User,
+        text: submission.text,
+        created_at_unix_ms: received_at_unix_ms,
+        in_reply_to: None,
+        review_thread_id: Some(thread_id.clone()),
+        attachments: submission.attachments,
+        image_attachments: vec![],
+    };
     {
         let mut review = session.review_conversations.lock().await;
         review
             .entry(thread_id.clone())
             .or_default()
             .messages
-            .push(ChatMessage {
-                id: message_id.clone(),
-                sequence,
-                role: ChatRole::User,
-                text: submission.text,
-                created_at_unix_ms: received_at_unix_ms,
-                in_reply_to: None,
-                attachments: submission.attachments,
-                image_attachments: vec![],
-            });
+            .push(review_message.clone());
     }
     session.review_notify.notify_waiters();
+    if let Err(error) = mirror_review_message(&session, review_message).await {
+        eprintln!(
+            "AgentNudge could not persist inline review history for {}: {error:#}",
+            session.session_id
+        );
+    }
     if let Err(error) = runtime.send_user_message(runtime_message).await {
         let _ = record_review_reply(
             &session,
@@ -2405,7 +2430,9 @@ async fn record_unrouted_runtime_error(session: &SessionState, message: String) 
         .lock()
         .await
         .messages
-        .last()
+        .iter()
+        .rev()
+        .find(|message| message.review_thread_id.is_none())
         .filter(|message| matches!(message.role, ChatRole::User))
         .map(|message| message.id.clone());
     let review_replies: Vec<_> = session
@@ -3867,7 +3894,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn review_thread_routes_runtime_reply_without_main_delivery() {
+    async fn review_thread_shares_chat_transcript_without_main_delivery() {
         use crate::runtime::RuntimeAdapterKind;
         use std::os::unix::fs::PermissionsExt;
 
@@ -3949,8 +3976,28 @@ for line in sys.stdin:
             response.messages[0].in_reply_to.as_deref(),
             Some(receipt.message_id.as_str())
         );
-        assert!(session.conversation.lock().await.messages.is_empty());
+        let shared = conversation(
+            AxumPath(created.session.clone()),
+            State(broker.clone()),
+            browser_headers(&session),
+            Query(ConversationQuery { after: 0 }),
+        )
+        .await;
+        let shared: ConversationResponse = response_json(shared).await;
+        assert_eq!(shared.messages.len(), 2);
+        assert!(matches!(shared.messages[0].role, ChatRole::User));
+        assert!(matches!(shared.messages[1].role, ChatRole::Agent));
+        assert!(
+            shared
+                .messages
+                .iter()
+                .all(|message| message.review_thread_id.as_deref() == Some("thread-2"))
+        );
         assert!(session.conversation.lock().await.inbound.is_empty());
+        assert_eq!(
+            wait_on_session(&session, Duration::ZERO).await.status,
+            "timeout"
+        );
 
         let feedback = submit_feedback(
             AxumPath(created.session.clone()),
@@ -3973,7 +4020,7 @@ for line in sys.stdin:
                 .count(),
             1
         );
-        assert!(session.conversation.lock().await.messages.is_empty());
+        assert_eq!(session.conversation.lock().await.messages.len(), 2);
 
         finish_session(&broker, &created.session).await.unwrap();
     }

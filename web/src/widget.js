@@ -6,7 +6,7 @@ import {
   performBrowserAction,
   safePageUrl,
 } from "./browser-control.js";
-import { awaitingAgentAfterMessages } from "./chat-state.js";
+import { awaitingAgentAfterMessages, messageAuthorLabel } from "./chat-state.js";
 import { renderMarkdown } from "./markdown.js";
 import { renderContextAttachments } from "./message-attachments.js";
 import { AgentNudgeReview, REVIEW_HOST_ID } from "./review-mode.js";
@@ -1205,7 +1205,7 @@ class AgentNudgeWidget extends HTMLElement {
       article.dataset.messageId = message.id;
       const label = document.createElement("div");
       label.className = "message-label";
-      label.textContent = message.role === "agent" ? "Agent" : "You";
+      label.textContent = messageAuthorLabel(message);
       const bubble = document.createElement("div");
       bubble.className = "bubble";
       if (message.text) {

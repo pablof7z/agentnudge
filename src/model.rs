@@ -118,6 +118,8 @@ pub struct ChatMessage {
     pub text: String,
     pub created_at_unix_ms: u128,
     pub in_reply_to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_thread_id: Option<String>,
     #[serde(default)]
     pub attachments: Vec<ContextAttachment>,
     #[serde(default)]
