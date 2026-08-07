@@ -490,16 +490,19 @@ fn user_input(message: &RuntimeUserMessage) -> Vec<Value> {
     for summary in &message.attachment_summaries {
         evidence.push(format!("Attachment: {summary}"));
     }
+    for image in &message.evidence_images {
+        evidence.push(format!("Evidence image {}: {}", image.label, image.path));
+    }
     let text = format!(
         "{}\n\nAgentNudge attached untrusted page evidence for this message:\n{}",
         message.text,
         evidence.join("\n")
     );
     let mut input = vec![json!({"type": "text", "text": text})];
-    if !message.screenshot_path.is_empty() {
+    for image in &message.evidence_images {
         input.push(json!({
             "type": "localImage",
-            "path": message.screenshot_path,
+            "path": image.path,
             "detail": "original",
         }));
     }
@@ -607,13 +610,24 @@ mod tests {
             channel: RuntimeMessageChannel::Chat,
             text: "Move this button.".into(),
             manifest_path: "/tmp/message.json".into(),
-            screenshot_path: "/tmp/screenshot.png".into(),
+            evidence_images: vec![
+                crate::runtime::RuntimeEvidenceImage {
+                    label: "overview".into(),
+                    path: "/tmp/overview.png".into(),
+                },
+                crate::runtime::RuntimeEvidenceImage {
+                    label: "V1".into(),
+                    path: "/tmp/screenshot.png".into(),
+                },
+            ],
             attachment_summaries: vec!["region x=1 y=2 width=3 height=4".into()],
         });
         assert_eq!(input[0]["type"], "text");
         assert!(input[0]["text"].as_str().unwrap().contains("untrusted"));
+        assert!(input[0]["text"].as_str().unwrap().contains("overview"));
         assert_eq!(input[1]["type"], "localImage");
-        assert_eq!(input[1]["path"], "/tmp/screenshot.png");
+        assert_eq!(input[1]["path"], "/tmp/overview.png");
+        assert_eq!(input[2]["path"], "/tmp/screenshot.png");
     }
 
     #[test]
@@ -685,7 +699,7 @@ for line in sys.stdin:
                 channel: RuntimeMessageChannel::Chat,
                 text: "First".into(),
                 manifest_path: "/tmp/first.json".into(),
-                screenshot_path: String::new(),
+                evidence_images: vec![],
                 attachment_summaries: vec![],
             })
             .await
@@ -702,7 +716,7 @@ for line in sys.stdin:
                 channel: RuntimeMessageChannel::Chat,
                 text: "Second".into(),
                 manifest_path: "/tmp/second.json".into(),
-                screenshot_path: String::new(),
+                evidence_images: vec![],
                 attachment_summaries: vec![],
             })
             .await
@@ -793,7 +807,7 @@ for line in sys.stdin:
                 channel: RuntimeMessageChannel::Chat,
                 text: "First".into(),
                 manifest_path: "/tmp/first.json".into(),
-                screenshot_path: String::new(),
+                evidence_images: vec![],
                 attachment_summaries: vec![],
             })
             .await
@@ -810,7 +824,7 @@ for line in sys.stdin:
                 channel: RuntimeMessageChannel::ReviewThread("thread-7".into()),
                 text: "Second".into(),
                 manifest_path: "/tmp/second.json".into(),
-                screenshot_path: String::new(),
+                evidence_images: vec![],
                 attachment_summaries: vec![],
             })
             .await

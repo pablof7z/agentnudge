@@ -5,6 +5,7 @@ import {
   browserCommandRequestUrl,
   createPageId,
   performBrowserAction,
+  screenshotPageRect,
   snapshotPage,
 } from "../src/browser-control.js";
 
@@ -98,7 +99,7 @@ test("captures a screenshot only through the supplied redacted capture callback"
   const result = await performBrowserAction(
     { kind: "screenshot" },
     {
-      document: {},
+      document: { documentElement: { scrollWidth: 800, scrollHeight: 2400 } },
       window: fakeWindow(),
       host: {},
       allowedOrigin: "http://localhost:5173",
@@ -111,7 +112,41 @@ test("captures a screenshot only through the supplied redacted capture callback"
   assert.equal(captures, 1);
   assert.deepEqual(result.value, {
     screenshotDataUrl: "data:image/png;base64,redacted",
+    pageRect: { x: 0, y: 0, width: 800, height: 600 },
   });
+});
+
+test("captures a distant document region without changing the current scroll position", () => {
+  const pageWindow = fakeWindow();
+  pageWindow.scrollY = 100;
+  const rect = screenshotPageRect(
+    { kind: "screenshot", x: 0, y: 4200, width: 800, height: 600 },
+    { documentElement: { scrollWidth: 800, scrollHeight: 6000 } },
+    pageWindow,
+    {},
+  );
+
+  assert.deepEqual(rect, { x: 0, y: 4200, width: 800, height: 600 });
+  assert.equal(pageWindow.scrollY, 100);
+});
+
+test("centers a padded targeted screenshot around a selected element", () => {
+  const pageWindow = fakeWindow();
+  pageWindow.scrollY = 3000;
+  const element = fakeElement({
+    getBoundingClientRect: () => ({ x: 100, y: 200, width: 200, height: 100 }),
+  });
+  const rect = screenshotPageRect(
+    { kind: "screenshot", selector: "#target", width: 500, height: 400, padding: 100 },
+    {
+      documentElement: { scrollWidth: 1200, scrollHeight: 8000 },
+      querySelector: () => element,
+    },
+    pageWindow,
+    { contains: () => false },
+  );
+
+  assert.deepEqual(rect, { x: 0, y: 3050, width: 500, height: 400 });
 });
 
 test("snapshot excludes form values and navigation stays on the allowed origin", async () => {

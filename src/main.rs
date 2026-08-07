@@ -172,6 +172,34 @@ enum BrowserCommand {
     Screenshot {
         /// Maximum foreground wait for the action result.
         duration: String,
+
+        /// Center the capture around the element matching this CSS selector.
+        #[arg(long)]
+        selector: Option<String>,
+
+        /// Center the capture around MESSAGE_ID:ATTACHMENT_ID from prior feedback.
+        #[arg(long)]
+        reference: Option<String>,
+
+        /// Document-space left edge. Defaults to the current scroll position.
+        #[arg(long, allow_hyphen_values = true)]
+        x: Option<f64>,
+
+        /// Document-space top edge. Defaults to the current scroll position.
+        #[arg(long, allow_hyphen_values = true)]
+        y: Option<f64>,
+
+        /// Capture width. Defaults to the connected viewport width.
+        #[arg(long)]
+        width: Option<f64>,
+
+        /// Capture height. Defaults to the connected viewport height.
+        #[arg(long)]
+        height: Option<f64>,
+
+        /// Context around a selector or feedback reference.
+        #[arg(long, default_value_t = 0.0)]
+        padding: f64,
     },
 
     /// Click the element matching a CSS selector.
@@ -285,9 +313,31 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 BrowserCommand::Snapshot { duration } => {
                     print_browser_result(&session, page, duration, BrowserAction::Snapshot).await?;
                 }
-                BrowserCommand::Screenshot { duration } => {
-                    print_browser_result(&session, page, duration, BrowserAction::Screenshot)
-                        .await?;
+                BrowserCommand::Screenshot {
+                    duration,
+                    selector,
+                    reference,
+                    x,
+                    y,
+                    width,
+                    height,
+                    padding,
+                } => {
+                    print_browser_result(
+                        &session,
+                        page,
+                        duration,
+                        BrowserAction::Screenshot {
+                            selector,
+                            reference,
+                            x,
+                            y,
+                            width,
+                            height,
+                            padding,
+                        },
+                    )
+                    .await?;
                 }
                 BrowserCommand::Click { duration, selector } => {
                     print_browser_result(
@@ -529,6 +579,35 @@ mod tests {
                 ..
             }
         ));
+        let targeted = Cli::try_parse_from([
+            "agentnudge",
+            "browser",
+            "lima",
+            "screenshot",
+            "10s",
+            "--reference",
+            "00000000-0000-4000-8000-000000000000:3A",
+            "--padding",
+            "300",
+        ])
+        .unwrap()
+        .command;
+        match targeted {
+            Command::Browser {
+                action:
+                    BrowserCommand::Screenshot {
+                        reference, padding, ..
+                    },
+                ..
+            } => {
+                assert_eq!(
+                    reference.as_deref(),
+                    Some("00000000-0000-4000-8000-000000000000:3A")
+                );
+                assert_eq!(padding, 300.0);
+            }
+            _ => panic!("expected a targeted browser screenshot command"),
+        }
         assert!(matches!(
             Cli::try_parse_from(["agentnudge", "reply", "lima", "10m", "--message", "Done"])
                 .unwrap()

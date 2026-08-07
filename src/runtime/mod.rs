@@ -44,8 +44,14 @@ pub struct RuntimeUserMessage {
     pub channel: RuntimeMessageChannel,
     pub text: String,
     pub manifest_path: String,
-    pub screenshot_path: String,
+    pub evidence_images: Vec<RuntimeEvidenceImage>,
     pub attachment_summaries: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeEvidenceImage {
+    pub label: String,
+    pub path: String,
 }
 
 impl RuntimeUserMessage {

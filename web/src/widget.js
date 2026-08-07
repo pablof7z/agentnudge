@@ -13,6 +13,7 @@ import { AgentNudgeReview, REVIEW_HOST_ID } from "./review-mode.js";
 import { replyImageLabel, replyImageRequestUrl } from "./reply-images.js";
 import { endSessionRequestUrl } from "./session-lifecycle.js";
 import { createUserInput, userInputStyles } from "./user-input.js";
+import { documentCaptureGeometry } from "./viewport-evidence.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
@@ -853,7 +854,7 @@ class AgentNudgeWidget extends HTMLElement {
         host: this,
         allowedOrigin: ALLOWED_ORIGIN,
         timeoutMs: remaining,
-        captureScreenshot: () => this.captureScreenshot(),
+        captureScreenshot: (pageRect) => this.captureScreenshot(pageRect, false),
       });
       value = result.value ?? null;
       afterAcknowledge = result.afterAcknowledge ?? null;
@@ -940,18 +941,22 @@ class AgentNudgeWidget extends HTMLElement {
     }
   }
 
-  async captureScreenshot() {
+  async captureScreenshot(pageRect = null, includeAttachments = true) {
+    const capture = pageRect || {
+      x: window.scrollX,
+      y: window.scrollY,
+      width: window.innerWidth,
+      height: window.innerHeight,
+    };
     const canvas = await html2canvas(document.documentElement, {
       backgroundColor: getComputedStyle(document.documentElement).backgroundColor || "#ffffff",
       logging: false,
       useCORS: true,
       allowTaint: false,
-      x: window.scrollX,
-      y: window.scrollY,
-      width: window.innerWidth,
-      height: window.innerHeight,
-      windowWidth: document.documentElement.scrollWidth,
-      windowHeight: document.documentElement.scrollHeight,
+      ...documentCaptureGeometry(capture, {
+        width: window.innerWidth,
+        height: window.innerHeight,
+      }),
       ignoreElements: (element) => element === this || element.id === REVIEW_HOST_ID,
       onclone: (cloneDocument) => {
         cloneDocument.getElementById(HOST_ID)?.remove();
@@ -972,16 +977,18 @@ class AgentNudgeWidget extends HTMLElement {
         }
       },
     });
-    const context = canvas.getContext("2d");
-    paintMessageAttachments({
-      context,
-      canvas,
-      viewport: { width: window.innerWidth, height: window.innerHeight },
-      attachments: this.draftAttachments,
-      resolveAttachmentRect: (attachment) => this.resolveAttachmentRect(attachment),
-      paintStroke: drawStroke,
-      paintMarker: drawAttachmentMarker,
-    });
+    if (includeAttachments) {
+      const context = canvas.getContext("2d");
+      paintMessageAttachments({
+        context,
+        canvas,
+        viewport: { width: window.innerWidth, height: window.innerHeight },
+        attachments: this.draftAttachments,
+        resolveAttachmentRect: (attachment) => this.resolveAttachmentRect(attachment),
+        paintStroke: drawStroke,
+        paintMarker: drawAttachmentMarker,
+      });
+    }
     return canvas.toDataURL("image/png");
   }
 

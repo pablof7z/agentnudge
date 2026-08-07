@@ -1,7 +1,7 @@
 import html2canvas from "html2canvas";
 import { placeFloatingRect, pointInClosedPath } from "./annotation-geometry.js";
 import { renderMarkdown } from "./markdown.js";
-import { paintReviewMarks } from "./review-capture.js";
+import { paintOverviewMap, paintReviewMarks } from "./review-capture.js";
 import { createUserInput, userInputStyles } from "./user-input.js";
 import {
   buildGroupedReviewPayload,
@@ -16,6 +16,17 @@ import {
   reviewThreadMessagesUrl,
   threadDisplayText,
 } from "./review-thread-model.js";
+import {
+  currentPageViewport,
+  documentCaptureGeometry,
+  overviewCanvasSize,
+  overviewScale,
+  planViewportCaptures,
+  toDocumentPoint,
+  toDocumentRect,
+  toViewportPoint,
+  toViewportRect,
+} from "./viewport-evidence.js";
 import iconUndo from "@tabler/icons/outline/arrow-back-up.svg";
 import iconRedo from "@tabler/icons/outline/arrow-forward-up.svg";
 import iconCheck from "@tabler/icons/outline/check.svg";
@@ -309,6 +320,7 @@ export class AgentNudgeReview extends HTMLElement {
     this.pendingRect = null;
     this.currentStroke = null;
     this.currentStrokeThreadId = null;
+    this.currentStrokeReferenceId = null;
     this.revealThreadAfterStroke = false;
     this.suppressNextClick = false;
     this.movingCard = false;
@@ -550,6 +562,8 @@ export class AgentNudgeReview extends HTMLElement {
     if (!target) return;
     this.localEdits = true;
     const point = { x: event.clientX, y: event.clientY };
+    const viewport = this.pageViewport();
+    const documentPoint = toDocumentPoint(point, viewport);
     event.preventDefault();
     event.stopImmediatePropagation();
     this.suppressNextClick = true;
@@ -578,27 +592,30 @@ export class AgentNudgeReview extends HTMLElement {
       const thread = active || this.createThread(point, null);
       this.currentStrokeThreadId = thread.id;
       this.revealThreadAfterStroke = !active;
-      let reference = thread.references.find((value) => value.kind === "drawing");
+      let reference = thread.references.find((value) => value.kind === "drawing" && sameViewport(value.viewport, viewport));
       if (!reference) {
         this.referenceCounter += 1;
         reference = {
           id: `reference-${this.referenceCounter}`,
           kind: "drawing",
           rect: null,
+          documentRect: null,
+          viewport,
           element: null,
           strokes: [],
         };
         thread.references.push(reference);
       }
+      this.currentStrokeReferenceId = reference.id;
       this.strokeCounter += 1;
       this.currentStroke = {
         id: `stroke-${this.strokeCounter}`,
-        points: [point],
+        points: [documentPoint],
         color: thread.color,
         width: INK_WIDTH,
       };
       reference.strokes.push(this.currentStroke);
-      reference.rect = drawingBounds(reference.strokes);
+      reference.documentRect = drawingBounds(reference.strokes);
       this.renderReferences();
       return;
     }
@@ -618,12 +635,13 @@ export class AgentNudgeReview extends HTMLElement {
     const point = { x: event.clientX, y: event.clientY };
     if (this.mode === "draw" && this.currentStroke) {
       event.preventDefault();
+      const documentPoint = toDocumentPoint(point, this.pageViewport());
       const last = this.currentStroke.points.at(-1);
-      if (!last || pointDistance(point, last) >= 1.5) {
-        this.currentStroke.points.push(point);
+      if (!last || pointDistance(documentPoint, last) >= 1.5) {
+        this.currentStroke.points.push(documentPoint);
         const thread = this.threads.find((value) => value.id === this.currentStrokeThreadId);
-        const reference = thread?.references.find((value) => value.kind === "drawing");
-        if (reference) reference.rect = drawingBounds(reference.strokes);
+        const reference = thread?.references.find((value) => value.id === this.currentStrokeReferenceId);
+        if (reference) reference.documentRect = drawingBounds(reference.strokes);
         this.renderReferences();
       }
       return;
@@ -655,16 +673,18 @@ export class AgentNudgeReview extends HTMLElement {
         this.currentStroke.points.push({ x: first.x + .01, y: first.y + .01 });
       }
       const threadId = this.currentStrokeThreadId;
+      const referenceId = this.currentStrokeReferenceId;
       const revealThread = this.revealThreadAfterStroke;
       this.currentStroke = null;
       this.currentStrokeThreadId = null;
+      this.currentStrokeReferenceId = null;
       this.revealThreadAfterStroke = false;
       const thread = this.threads.find((value) => value.id === threadId);
       if (revealThread && thread) {
-        const drawing = thread.references.find((reference) => reference.kind === "drawing");
+        const drawing = thread.references.find((reference) => reference.id === referenceId);
         if (drawing) {
-          drawing.rect = drawingBounds(drawing.strokes);
-          thread.cardPosition = placeThreadCard(point, drawing.rect);
+          drawing.documentRect = drawingBounds(drawing.strokes);
+          thread.cardPosition = placeThreadCard(point, toViewportRect(drawing.documentRect, this.pageViewport()));
         }
         this.activeThreadId = threadId;
         this.highlightedThreadId = threadId;
@@ -678,7 +698,15 @@ export class AgentNudgeReview extends HTMLElement {
       event.stopImmediatePropagation();
       const dragged = this.pendingRect && this.pendingRect.width >= 6 && this.pendingRect.height >= 6;
       if (dragged) {
-        this.addReference({ kind: "region", rect: { ...this.pendingRect }, element: null, strokes: [] }, point);
+        const viewport = this.pageViewport();
+        this.addReference({
+          kind: "region",
+          rect: { ...this.pendingRect },
+          documentRect: toDocumentRect(this.pendingRect, viewport),
+          viewport,
+          element: null,
+          strokes: [],
+        }, point);
       } else {
         const element = meaningfulTarget(this.pointerTarget);
         if (element) this.addElementReference(element, point);
@@ -729,6 +757,8 @@ export class AgentNudgeReview extends HTMLElement {
 
   addElementReference(element, point) {
     const description = describeElement(element);
+    const viewport = this.pageViewport();
+    const rect = plainRect(element.getBoundingClientRect());
     const thread = this.activeThread();
     if (thread?.references.some((reference) => reference.kind === "element" && reference.element?.selector === description.selector)) {
       this.setStatus("That element is already in this feedback thread.");
@@ -736,7 +766,9 @@ export class AgentNudgeReview extends HTMLElement {
     }
     this.addReference({
       kind: "element",
-      rect: plainRect(element.getBoundingClientRect()),
+      rect,
+      documentRect: toDocumentRect(rect, viewport),
+      viewport,
       element: description,
       strokes: [],
     }, point);
@@ -747,7 +779,13 @@ export class AgentNudgeReview extends HTMLElement {
     const thread = this.activeThread() || this.createThread(point, reference.rect);
     this.activeThreadId = thread.id;
     this.referenceCounter += 1;
-    thread.references.push({ id: `reference-${this.referenceCounter}`, ...reference });
+    const viewport = reference.viewport || this.pageViewport();
+    thread.references.push({
+      id: `reference-${this.referenceCounter}`,
+      ...reference,
+      viewport,
+      documentRect: reference.documentRect || (reference.rect ? toDocumentRect(reference.rect, viewport) : null),
+    });
     thread.pending = false;
     this.highlightedThreadId = thread.id;
     this.render();
@@ -756,15 +794,22 @@ export class AgentNudgeReview extends HTMLElement {
 
   createThread(point, rect) {
     this.threadCounter += 1;
+    const viewport = this.pageViewport();
     const cardPosition = placeThreadCard(point, rect);
     const thread = createReviewThread({
       id: `thread-${this.threadCounter}`,
       number: this.threadCounter,
       cardPosition,
       anchor: point,
+      viewport,
+      documentAnchor: toDocumentPoint(point, viewport),
     });
     this.threads.push(thread);
     return thread;
+  }
+
+  pageViewport() {
+    return currentPageViewport(window, document);
   }
 
   activeThread() {
@@ -794,7 +839,7 @@ export class AgentNudgeReview extends HTMLElement {
     this.setStatus("Capturing context for the embedded agent.");
     let accepted = false;
     try {
-      const screenshotDataUrl = await this.captureScreenshot(captureThreads);
+      const evidence = await this.captureReviewEvidence(captureThreads);
       const current = this.threads.find((value) => value.id === threadId);
       if (!current) return;
       const response = await fetch(reviewThreadMessagesUrl(ENDPOINT, threadId), {
@@ -810,7 +855,7 @@ export class AgentNudgeReview extends HTMLElement {
           thread: current,
           question: message,
           page: this.pageContext(),
-          screenshotDataUrl,
+          evidence,
         })),
         signal: this.abort.signal,
       });
@@ -974,10 +1019,11 @@ export class AgentNudgeReview extends HTMLElement {
   }
 
   hitStroke(point) {
+    const documentPoint = toDocumentPoint(point, this.pageViewport());
     for (const thread of [...this.threads].reverse()) {
       for (const reference of [...thread.references].reverse()) {
         if (reference.kind !== "drawing") continue;
-        const stroke = [...reference.strokes].reverse().find((value) => strokeHitDistance(point, value) <= Math.max(8, value.width + 5));
+        const stroke = [...reference.strokes].reverse().find((value) => strokeHitDistance(documentPoint, value) <= Math.max(8, value.width + 5));
         if (stroke) return { thread, reference, stroke };
       }
     }
@@ -991,7 +1037,7 @@ export class AgentNudgeReview extends HTMLElement {
       for (const reference of thread.references) {
         if (reference.kind !== "drawing") continue;
         reference.strokes = reference.strokes.filter((stroke) => !this.selectedStrokeIds.has(stroke.id));
-        reference.rect = drawingBounds(reference.strokes);
+        reference.documentRect = drawingBounds(reference.strokes);
       }
       thread.references = thread.references.filter((reference) => reference.kind !== "drawing" || reference.strokes.length);
     }
@@ -1048,19 +1094,32 @@ export class AgentNudgeReview extends HTMLElement {
     this.pendingRect = null;
     this.currentStroke = null;
     this.currentStrokeThreadId = null;
+    this.currentStrokeReferenceId = null;
     this.revealThreadAfterStroke = false;
   }
 
   resolveReferenceRect(reference) {
+    const viewport = this.pageViewport();
     if (reference.kind === "element" && reference.element?.selector) {
       try {
         const element = document.querySelector(reference.element.selector);
-        if (element) reference.rect = plainRect(element.getBoundingClientRect());
+        if (element) {
+          const rect = plainRect(element.getBoundingClientRect());
+          reference.documentRect = toDocumentRect(rect, viewport);
+        }
       } catch {}
     } else if (reference.kind === "drawing") {
-      reference.rect = drawingBounds(reference.strokes);
+      reference.documentRect = drawingBounds(reference.strokes);
     }
-    return reference.rect;
+    if (!reference.documentRect && reference.rect) {
+      reference.documentRect = toDocumentRect(reference.rect, reference.viewport || viewport);
+    }
+    return reference.documentRect ? toViewportRect(reference.documentRect, viewport) : reference.rect;
+  }
+
+  resolveReferenceDocumentRect(reference) {
+    this.resolveReferenceRect(reference);
+    return reference.documentRect;
   }
 
   onViewportChange() {
@@ -1071,55 +1130,101 @@ export class AgentNudgeReview extends HTMLElement {
     this.renderReferences();
   }
 
-  async captureScreenshot(threads = this.threads) {
+  async captureReviewEvidence(threads = this.threads) {
+    for (const thread of threads) {
+      for (const reference of thread.references) this.resolveReferenceDocumentRect(reference);
+    }
+    const plan = planViewportCaptures(threads);
+    const captures = [];
+    for (const capture of plan.captures) {
+      captures.push({
+        ...capture,
+        kind: "viewport",
+        screenshotDataUrl: await this.capturePageRect(capture.pageRect, threads, capture.id, plan.assignments),
+      });
+    }
+    const overview = await this.captureOverview(captures);
+    return { captures, overview, assignments: plan.assignments };
+  }
+
+  async capturePageRect(pageRect, threads, captureId, assignments) {
     const canvas = await html2canvas(document.documentElement, {
       backgroundColor: getComputedStyle(document.documentElement).backgroundColor || "#ffffff",
       logging: false,
       useCORS: true,
       allowTaint: false,
-      x: window.scrollX,
-      y: window.scrollY,
-      width: window.innerWidth,
-      height: window.innerHeight,
-      windowWidth: document.documentElement.scrollWidth,
-      windowHeight: document.documentElement.scrollHeight,
+      ...documentCaptureGeometry(pageRect),
       ignoreElements: (element) => element === this || element.id === CHAT_HOST_ID,
-      onclone: (cloneDocument) => {
-        cloneDocument.getElementById(CHAT_HOST_ID)?.remove();
-        cloneDocument.getElementById(REVIEW_HOST_ID)?.remove();
-        for (const input of cloneDocument.querySelectorAll("input")) {
-          input.value = "[redacted]";
-          input.setAttribute("value", "[redacted]");
-          input.removeAttribute("checked");
-        }
-        for (const textarea of cloneDocument.querySelectorAll("textarea")) {
-          textarea.value = "[redacted]";
-          textarea.textContent = "[redacted]";
-        }
-        for (const node of cloneDocument.querySelectorAll("[data-agentnudge-redact]")) {
-          node.textContent = "[redacted]";
-          node.removeAttribute("src");
-          node.removeAttribute("href");
-        }
-      },
+      onclone: (cloneDocument) => this.redactScreenshotClone(cloneDocument),
     });
     const context = canvas.getContext("2d");
     paintReviewMarks({
       context,
       canvas,
-      viewport: { width: window.innerWidth, height: window.innerHeight },
+      viewport: { width: pageRect.width, height: pageRect.height },
+      captureRect: pageRect,
       threads,
-      resolveReferenceRect: (reference) => this.resolveReferenceRect(reference),
+      resolveReferenceRect: (reference) => reference.documentRect,
+      includeReference: (thread, reference) => assignments[`${thread.id}:${reference.id}`] === captureId,
+      includePageNote: (thread) => assignments[`${thread.id}:page-note`] === captureId,
     });
     return canvas.toDataURL("image/png");
   }
 
-  buildPayload(screenshotDataUrl) {
+  async captureOverview(captures) {
+    const viewport = this.pageViewport();
+    const documentSize = { width: viewport.documentWidth, height: viewport.documentHeight };
+    const pageRect = { x: 0, y: 0, ...documentSize };
+    const rendered = await html2canvas(document.documentElement, {
+      backgroundColor: getComputedStyle(document.documentElement).backgroundColor || "#ffffff",
+      logging: false,
+      useCORS: true,
+      allowTaint: false,
+      ...documentCaptureGeometry(pageRect, viewport),
+      scale: overviewScale(documentSize.width, documentSize.height),
+      ignoreElements: (element) => element === this || element.id === CHAT_HOST_ID,
+      onclone: (cloneDocument) => this.redactScreenshotClone(cloneDocument),
+    });
+    const size = overviewCanvasSize(documentSize.width, documentSize.height);
+    const canvas = document.createElement("canvas");
+    canvas.width = size.width;
+    canvas.height = size.height;
+    canvas.getContext("2d").drawImage(rendered, 0, 0, size.width, size.height);
+    paintOverviewMap({ context: canvas.getContext("2d"), canvas, documentSize, captures });
+    return {
+      id: "overview",
+      kind: "overview",
+      pageRect,
+      attachmentIds: captures.flatMap((capture) => capture.attachmentIds),
+      screenshotDataUrl: canvas.toDataURL("image/png"),
+    };
+  }
+
+  redactScreenshotClone(cloneDocument) {
+    cloneDocument.getElementById(CHAT_HOST_ID)?.remove();
+    cloneDocument.getElementById(REVIEW_HOST_ID)?.remove();
+    for (const input of cloneDocument.querySelectorAll("input")) {
+      input.value = "[redacted]";
+      input.setAttribute("value", "[redacted]");
+      input.removeAttribute("checked");
+    }
+    for (const textarea of cloneDocument.querySelectorAll("textarea")) {
+      textarea.value = "[redacted]";
+      textarea.textContent = "[redacted]";
+    }
+    for (const node of cloneDocument.querySelectorAll("[data-agentnudge-redact]")) {
+      node.textContent = "[redacted]";
+      node.removeAttribute("src");
+      node.removeAttribute("href");
+    }
+  }
+
+  buildPayload(evidence) {
     return buildGroupedReviewPayload({
       sessionId: SESSION_ID,
       threads: this.threads,
       page: this.pageContext(),
-      screenshotDataUrl,
+      evidence,
     });
   }
 
@@ -1158,7 +1263,7 @@ export class AgentNudgeReview extends HTMLElement {
     this.render();
     this.setStatus("Capturing grouped feedback.");
     try {
-      const screenshotDataUrl = await this.captureScreenshot();
+      const evidence = await this.captureReviewEvidence();
       const response = await fetch(`${ENDPOINT}/feedback`, {
         method: "POST",
         mode: "cors",
@@ -1167,7 +1272,7 @@ export class AgentNudgeReview extends HTMLElement {
           "Content-Type": "application/json",
           "X-AgentNudge-Token": BROWSER_TOKEN,
         },
-        body: JSON.stringify(this.buildPayload(screenshotDataUrl)),
+        body: JSON.stringify(this.buildPayload(evidence)),
       });
       const result = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(result.message || result.error || `HTTP ${response.status}`);
@@ -1433,16 +1538,18 @@ export class AgentNudgeReview extends HTMLElement {
         const label = referenceLabel(thread, index);
         const rect = this.resolveReferenceRect(reference);
         if (reference.kind === "drawing") {
+          const viewport = this.pageViewport();
           for (const stroke of reference.strokes) {
+            const points = stroke.points.map((point) => toViewportPoint(point, viewport));
             if (this.selectedStrokeIds.has(stroke.id)) {
               nodes.push(svgElement("path", {
                 class: "selection-outline",
-                d: strokePath(stroke.points),
+                d: strokePath(points),
                 opacity,
               }));
             }
             nodes.push(svgElement("path", {
-              d: strokePath(stroke.points),
+              d: strokePath(points),
               fill: "none",
               stroke: thread.color,
               "stroke-width": stroke.width,
@@ -1467,7 +1574,10 @@ export class AgentNudgeReview extends HTMLElement {
         if (rect) nodes.push(...markerNodes(rect, label, thread.color, opacity));
       });
       if (!thread.references.length) {
-        const rect = { x: thread.anchor.x - 1, y: thread.anchor.y - 1, width: 2, height: 2 };
+        const anchor = thread.documentAnchor
+          ? toViewportPoint(thread.documentAnchor, this.pageViewport())
+          : thread.anchor;
+        const rect = { x: anchor.x - 1, y: anchor.y - 1, width: 2, height: 2 };
         nodes.push(...markerNodes(rect, String(thread.number), thread.color, opacity));
       }
     }
@@ -1498,7 +1608,8 @@ function referenceDescription(reference) {
     return `${reference.strokes.length} stroke${reference.strokes.length === 1 ? "" : "s"}`;
   }
   if (reference.kind === "region") {
-    return `${Math.round(reference.rect.width)} × ${Math.round(reference.rect.height)}`;
+    const rect = reference.documentRect || reference.rect;
+    return `${Math.round(rect.width)} × ${Math.round(rect.height)}`;
   }
   return reference.element?.accessibleName || reference.element?.text || reference.element?.tag || "Element";
 }
@@ -1667,21 +1778,29 @@ function colorWithAlpha(color, alpha) {
 
 function normalizeReviewState(state) {
   if (!state || typeof state !== "object" || !Array.isArray(state.threads)) return null;
+  const fallbackViewport = currentPageViewport(window, document);
   const threads = state.threads
     .filter((thread) => thread && typeof thread === "object" && /^[A-Za-z0-9_-]{1,64}$/.test(thread.id))
     .slice(0, 100)
     .map((thread, index) => {
       const number = Number.isFinite(Number(thread.number)) ? Math.max(1, Number(thread.number)) : index + 1;
+      const viewport = safeViewport(thread.viewport, fallbackViewport);
+      const anchor = safePoint(thread.anchor, { x: 36, y: 36 });
       const base = createReviewThread({
         id: thread.id,
         number,
         cardPosition: safePoint(thread.cardPosition, { x: 36, y: 36 }),
-        anchor: safePoint(thread.anchor, { x: 36, y: 36 }),
+        anchor,
+        viewport,
+        documentAnchor: safePoint(thread.documentAnchor, toDocumentPoint(anchor, viewport)),
       });
+      const references = Array.isArray(thread.references)
+        ? thread.references.slice(0, 100).map((reference) => normalizeReference(reference, viewport))
+        : [];
       return {
         ...base,
         color: typeof thread.color === "string" ? thread.color : base.color,
-        references: Array.isArray(thread.references) ? structuredClone(thread.references.slice(0, 100)) : [],
+        references,
         draft: typeof thread.draft === "string" ? thread.draft.slice(0, 5000) : "",
         feedbackText: typeof thread.feedbackText === "string" ? thread.feedbackText.slice(0, 5000) : "",
         conversation: Array.isArray(thread.conversation)
@@ -1698,6 +1817,43 @@ function normalizeReviewState(state) {
     referenceCounter: Math.max(0, Number(state.referenceCounter) || 0),
     strokeCounter: Math.max(0, Number(state.strokeCounter) || 0),
   };
+}
+
+function normalizeReference(reference, threadViewport) {
+  const value = structuredClone(reference);
+  value.viewport = safeViewport(value.viewport, threadViewport);
+  if (value.kind === "drawing" && !value.documentRect) {
+    value.strokes = (value.strokes || []).map((stroke) => ({
+      ...stroke,
+      points: (stroke.points || []).map((point) => toDocumentPoint(point, value.viewport)),
+    }));
+    value.documentRect = drawingBounds(value.strokes);
+  } else if (!value.documentRect && value.rect) {
+    value.documentRect = toDocumentRect(value.rect, value.viewport);
+  }
+  return value;
+}
+
+function safeViewport(value, fallback) {
+  const candidate = {
+    scrollX: Number(value?.scrollX),
+    scrollY: Number(value?.scrollY),
+    width: Number(value?.width),
+    height: Number(value?.height),
+    documentWidth: Number(value?.documentWidth),
+    documentHeight: Number(value?.documentHeight),
+  };
+  return Object.values(candidate).every(Number.isFinite) && candidate.width > 0 && candidate.height > 0
+    ? candidate
+    : { ...fallback };
+}
+
+function sameViewport(first, second) {
+  if (!first || !second) return false;
+  return Math.abs(first.scrollX - second.scrollX) < 2
+    && Math.abs(first.scrollY - second.scrollY) < 2
+    && Math.abs(first.width - second.width) < 2
+    && Math.abs(first.height - second.height) < 2;
 }
 
 function safePoint(value, fallback) {

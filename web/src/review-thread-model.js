@@ -7,13 +7,17 @@ export const THREAD_COLORS = [
   "#be5b8a",
 ];
 
-export function createReviewThread({ id, number, cardPosition, anchor }) {
+import { toViewportRect } from "./viewport-evidence.js";
+
+export function createReviewThread({ id, number, cardPosition, anchor, viewport = null, documentAnchor = null }) {
   return {
     id,
     number,
     color: THREAD_COLORS[(number - 1) % THREAD_COLORS.length],
     cardPosition: { ...cardPosition },
     anchor: { ...anchor },
+    viewport: viewport ? { ...viewport } : null,
+    documentAnchor: documentAnchor ? { ...documentAnchor } : null,
     references: [],
     draft: "",
     feedbackText: "",
@@ -50,23 +54,27 @@ export function latestAgentReplyPreview(thread) {
     .trim();
 }
 
-export function buildGroupedReviewPayload({ sessionId, threads, page, screenshotDataUrl }) {
+export function buildGroupedReviewPayload({ sessionId, threads, page, evidence = null, screenshotDataUrl = "" }) {
   return {
     sessionId,
     text: groupedReviewText(threads),
     page,
-    attachments: groupedReviewAttachments(threads),
-    screenshotDataUrl,
+    attachments: groupedReviewAttachments(threads, evidence),
+    screenshotDataUrl: evidence ? "" : screenshotDataUrl,
+    captures: evidence?.captures || [],
+    overview: evidence?.overview || null,
   };
 }
 
-export function buildThreadQuestionPayload({ sessionId, thread, question, page, screenshotDataUrl }) {
+export function buildThreadQuestionPayload({ sessionId, thread, question, page, evidence = null, screenshotDataUrl = "" }) {
   return {
     sessionId,
     text: question,
     page,
-    attachments: groupedReviewAttachments([thread]),
-    screenshotDataUrl,
+    attachments: groupedReviewAttachments([thread], evidence),
+    screenshotDataUrl: evidence ? "" : screenshotDataUrl,
+    captures: evidence?.captures || [],
+    overview: evidence?.overview || null,
   };
 }
 
@@ -117,20 +125,29 @@ export function groupedReviewText(threads) {
   return lines.join("\n");
 }
 
-export function groupedReviewAttachments(threads) {
+export function groupedReviewAttachments(threads, evidence = null) {
+  const captureById = new Map((evidence?.captures || []).map((capture) => [capture.id, capture]));
+  const assignments = evidence?.assignments || {};
   const attachments = [];
   for (const thread of threads) {
     const summary = attachmentComment(thread);
     if (!thread.references.length) {
+      const key = `${thread.id}:page-note`;
+      const captureId = assignments[key] || null;
+      const documentRect = thread.documentAnchor
+        ? { x: thread.documentAnchor.x - 1, y: thread.documentAnchor.y - 1, width: 2, height: 2 }
+        : null;
       attachments.push({
         id: `${thread.id}-page-note`,
         kind: "region",
-        rect: {
+        rect: captureRelativeRect(documentRect, captureById.get(captureId)) || {
           x: thread.anchor.x - 1,
           y: thread.anchor.y - 1,
           width: 2,
           height: 2,
         },
+        documentRect,
+        captureId,
         element: null,
         comment: `[Thread ${thread.number}] ${summary}`,
         strokes: [],
@@ -139,17 +156,44 @@ export function groupedReviewAttachments(threads) {
     }
     thread.references.forEach((reference, index) => {
       const label = referenceLabel(thread, index);
+      const key = `${thread.id}:${reference.id}`;
+      const captureId = assignments[key] || null;
+      const capture = captureById.get(captureId);
       attachments.push({
         id: `${thread.id}-${reference.id}`,
         kind: reference.kind,
-        rect: reference.rect ? { ...reference.rect } : null,
+        rect: captureRelativeRect(reference.documentRect, capture)
+          || (reference.rect ? { ...reference.rect } : null),
+        documentRect: reference.documentRect ? { ...reference.documentRect } : null,
+        captureId,
         element: reference.kind === "element" ? { ...reference.element } : null,
         comment: `[${label} · Thread ${thread.number}] ${summary}`,
-        strokes: reference.kind === "drawing" ? structuredClone(reference.strokes || []) : [],
+        strokes: reference.kind === "drawing"
+          ? captureRelativeStrokes(reference.strokes || [], capture)
+          : [],
       });
     });
   }
   return attachments;
+}
+
+function captureRelativeRect(documentRect, capture) {
+  if (!documentRect || !capture?.pageRect) return null;
+  return toViewportRect(documentRect, {
+    scrollX: capture.pageRect.x,
+    scrollY: capture.pageRect.y,
+  });
+}
+
+function captureRelativeStrokes(strokes, capture) {
+  if (!capture?.pageRect) return structuredClone(strokes);
+  return strokes.map((stroke) => ({
+    ...structuredClone(stroke),
+    points: stroke.points.map((point) => ({
+      x: point.x - capture.pageRect.x,
+      y: point.y - capture.pageRect.y,
+    })),
+  }));
 }
 
 export function drawingBounds(strokes) {

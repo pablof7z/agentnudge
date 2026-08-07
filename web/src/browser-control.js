@@ -45,8 +45,12 @@ export async function performBrowserAction(action, context) {
       if (typeof context.captureScreenshot !== "function") {
         throw new Error("Screenshot capture is unavailable");
       }
+      const pageRect = screenshotPageRect(action, pageDocument, pageWindow, host);
       return {
-        value: { screenshotDataUrl: await context.captureScreenshot() },
+        value: {
+          screenshotDataUrl: await context.captureScreenshot(pageRect),
+          pageRect,
+        },
       };
     }
     case "click": {
@@ -122,6 +126,41 @@ export async function performBrowserAction(action, context) {
     default:
       throw new Error("Unsupported browser action");
   }
+}
+
+export function screenshotPageRect(action, pageDocument, pageWindow, host) {
+  const root = pageDocument.documentElement;
+  const documentWidth = Math.max(root?.scrollWidth || 0, pageWindow.innerWidth);
+  const documentHeight = Math.max(root?.scrollHeight || 0, pageWindow.innerHeight);
+  const padding = Math.max(0, Number(action.padding) || 0);
+  let width = Math.max(1, Number(action.width) || pageWindow.innerWidth);
+  let height = Math.max(1, Number(action.height) || pageWindow.innerHeight);
+  let x = Number.isFinite(Number(action.x)) ? Number(action.x) : pageWindow.scrollX;
+  let y = Number.isFinite(Number(action.y)) ? Number(action.y) : pageWindow.scrollY;
+
+  if (action.selector) {
+    const element = controlledElement(pageDocument, host, action.selector);
+    const rect = element.getBoundingClientRect();
+    const documentRect = {
+      x: rect.x + pageWindow.scrollX,
+      y: rect.y + pageWindow.scrollY,
+      width: rect.width,
+      height: rect.height,
+    };
+    width = Math.max(width, documentRect.width + padding * 2);
+    height = Math.max(height, documentRect.height + padding * 2);
+    x = documentRect.x + documentRect.width / 2 - width / 2;
+    y = documentRect.y + documentRect.height / 2 - height / 2;
+  }
+
+  width = Math.min(width, documentWidth);
+  height = Math.min(height, documentHeight);
+  return {
+    x: clamp(x, 0, Math.max(0, documentWidth - width)),
+    y: clamp(y, 0, Math.max(0, documentHeight - height)),
+    width,
+    height,
+  };
 }
 
 export function snapshotPage(pageDocument, pageWindow, host) {
@@ -254,4 +293,8 @@ function normalizedText(value) {
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(value, maximum));
 }
