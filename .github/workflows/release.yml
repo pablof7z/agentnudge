@@ -117,17 +117,10 @@ jobs:
 
           $hash = (Get-FileHash -LiteralPath "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath "dist/SHA256SUMS" -Value "$hash  $archive"
-          $server = Start-Process python -ArgumentList "-m", "http.server", "8123", "--directory", "dist" -PassThru
-          try {
-            Start-Sleep -Seconds 2
-            ./scripts/install.ps1 `
-              -InstallDir "$env:RUNNER_TEMP/agentnudge-bin" `
-              -ReleaseUrl "http://127.0.0.1:8123"
-            & "$env:RUNNER_TEMP/agentnudge-bin/agentnudge.exe" --version
-          }
-          finally {
-            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
-          }
+          ./scripts/install.ps1 `
+            -InstallDir "$env:RUNNER_TEMP/agentnudge-bin" `
+            -ReleaseUrl (Resolve-Path dist).Path
+          & "$env:RUNNER_TEMP/agentnudge-bin/agentnudge.exe" --version
 
       - uses: actions/upload-artifact@v7
         with:
