@@ -32,9 +32,29 @@ $checksumsPath = Join-Path $temporaryDirectory "SHA256SUMS"
 
 New-Item -ItemType Directory -Force -Path $temporaryDirectory | Out-Null
 
+function Get-ReleaseFile {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Destination
+    )
+
+    if ($ReleaseUrl -match '^https?://') {
+        Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseUrl/$Name" -OutFile $Destination
+        return
+    }
+    if (Test-Path -LiteralPath $ReleaseUrl -PathType Container) {
+        Copy-Item -LiteralPath (Join-Path $ReleaseUrl $Name) -Destination $Destination
+        return
+    }
+    throw "ReleaseUrl must be an HTTP(S) URL or a local directory; received $ReleaseUrl."
+}
+
 try {
-    Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseUrl/$archiveName" -OutFile $archivePath
-    Invoke-WebRequest -UseBasicParsing -Uri "$ReleaseUrl/SHA256SUMS" -OutFile $checksumsPath
+    Get-ReleaseFile -Name $archiveName -Destination $archivePath
+    Get-ReleaseFile -Name "SHA256SUMS" -Destination $checksumsPath
 
     $escapedArchive = [regex]::Escape($archiveName)
     $checksumLine = Get-Content -LiteralPath $checksumsPath |
