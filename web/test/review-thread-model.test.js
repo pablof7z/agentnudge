@@ -64,6 +64,68 @@ test("keeps grouped references and the inline transcript in the final batch", ()
   assert.match(payload.attachments[1].comment, /\[1B · Thread 1\]/);
 });
 
+test("ties each attachment to its detailed viewport capture and includes the overview", () => {
+  const first = thread(1);
+  first.references.push({
+    id: "ref-1",
+    kind: "region",
+    rect: { x: 20, y: 30, width: 40, height: 50 },
+    documentRect: { x: 20, y: 30, width: 40, height: 50 },
+    element: null,
+  });
+  const second = thread(2);
+  second.references.push({
+    id: "ref-2",
+    kind: "region",
+    rect: { x: 80, y: 100, width: 60, height: 70 },
+    documentRect: { x: 80, y: 5300, width: 60, height: 70 },
+    element: null,
+  });
+  const evidence = {
+    assignments: {
+      "thread-1:ref-1": "V1",
+      "thread-2:ref-2": "V2",
+    },
+    captures: [
+      {
+        id: "V1",
+        kind: "viewport",
+        pageRect: { x: 0, y: 0, width: 1200, height: 800 },
+        attachmentIds: ["thread-1-ref-1"],
+        screenshotDataUrl: "data:image/png;base64,one",
+      },
+      {
+        id: "V2",
+        kind: "viewport",
+        pageRect: { x: 0, y: 5200, width: 1200, height: 800 },
+        attachmentIds: ["thread-2-ref-2"],
+        screenshotDataUrl: "data:image/png;base64,two",
+      },
+    ],
+    overview: {
+      id: "overview",
+      kind: "overview",
+      pageRect: { x: 0, y: 0, width: 1200, height: 8000 },
+      attachmentIds: ["thread-1-ref-1", "thread-2-ref-2"],
+      screenshotDataUrl: "data:image/png;base64,map",
+    },
+  };
+
+  const payload = buildGroupedReviewPayload({
+    sessionId: "lima",
+    threads: [first, second],
+    page: { title: "Long page" },
+    evidence,
+  });
+
+  assert.equal(payload.screenshotDataUrl, "");
+  assert.equal(payload.captures.length, 2);
+  assert.equal(payload.overview.id, "overview");
+  assert.equal(payload.attachments[0].captureId, "V1");
+  assert.deepEqual(payload.attachments[1].rect, { x: 80, y: 100, width: 60, height: 70 });
+  assert.deepEqual(payload.attachments[1].documentRect, { x: 80, y: 5300, width: 60, height: 70 });
+});
+
 test("represents an unanchored page note as a tiny region attachment", () => {
   const value = thread(3);
   value.feedbackText = "General spacing feels cramped";

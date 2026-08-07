@@ -25,6 +25,10 @@
       .card strong { display: block; margin-bottom: 8px; }
       .card p { margin: 0; color: #716d64; font-size: 14px; line-height: 1.45; }
       .secret { margin-top: 42px; display: grid; gap: 6px; max-width: 320px; color: #64615a; font-size: 13px; }
+      .long-spacer { height: 2600px; }
+      .lower-demo { margin-bottom: 18vh; padding: 36px; border: 1px solid #d0cbbc; border-radius: 18px; background: #f9f7ef; }
+      .lower-demo h2 { margin: 0 0 10px; font-size: 34px; letter-spacing: -.04em; }
+      .lower-demo p { max-width: 600px; margin: 0; color: #716d64; line-height: 1.55; }
       input { border: 1px solid #c8c3b6; border-radius: 8px; padding: 10px; background: white; }
       @media (max-width: 720px) { .demo-grid { grid-template-columns: 1fr; } }
     </style>
@@ -57,6 +61,16 @@
       });
 
       const parameters = new URLSearchParams(location.search);
+      if (parameters.get("long") === "1") {
+        document.querySelector("main").insertAdjacentHTML("beforeend", `
+          <div class="long-spacer" aria-hidden="true"></div>
+          <section class="lower-demo" id="lower-target">
+            <div class="eyebrow">Far below the fold</div>
+            <h2>A second visual context</h2>
+            <p>This section exists to verify that feedback added far down a long page receives its own detailed viewport capture and remains visible in the overview map.</p>
+          </section>
+        `);
+      }
       const session = parameters.get("agentnudge");
       const requestedPort = Number(parameters.get("agentnudgePort") || "4317");
       const brokerPort = Number.isInteger(requestedPort) && requestedPort > 0 && requestedPort <= 65535

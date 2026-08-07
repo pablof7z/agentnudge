@@ -33,20 +33,21 @@ use crate::model::{
     AgentReplyImageUpload, AgentReplySubmission, BrowserAction, BrowserActionRequest,
     BrowserActionResponse, BrowserCommand, BrowserCommandPollResponse,
     BrowserCommandResultSubmission, BrowserPage, BrowserPagesResponse, ChatMessage, ChatRole,
-    ChatSubmission, ConversationResponse, InboundMessage, MAX_BROWSER_FILL_CHARS,
-    MAX_BROWSER_RESULT_BYTES, MAX_BROWSER_SELECTOR_CHARS, MAX_REPLY_IMAGE_ATTACHMENTS,
-    MAX_REPLY_IMAGE_BYTES, MAX_REPLY_IMAGE_TOTAL_BYTES, MAX_SCREENSHOT_BYTES, MessageManifest,
-    MessageReceipt, PROTOCOL_VERSION, ReplyImageAttachment, ReplyReceipt,
-    ReviewConversationResponse, TrustBoundary,
+    ChatSubmission, ConversationResponse, EvidenceCapture, EvidenceCaptureSubmission,
+    InboundMessage, MAX_BROWSER_FILL_CHARS, MAX_BROWSER_RESULT_BYTES, MAX_BROWSER_SELECTOR_CHARS,
+    MAX_EVIDENCE_IMAGE_TOTAL_BYTES, MAX_REPLY_IMAGE_ATTACHMENTS, MAX_REPLY_IMAGE_BYTES,
+    MAX_REPLY_IMAGE_TOTAL_BYTES, MAX_SCREENSHOT_BYTES, MessageManifest, MessageReceipt,
+    PROTOCOL_VERSION, ReplyImageAttachment, ReplyReceipt, ReviewConversationResponse,
+    TrustBoundary,
 };
 use crate::runtime::{
-    RuntimeEvent, RuntimeHandle, RuntimeLaunchConfig, RuntimeMessageChannel, RuntimeReplyTarget,
-    RuntimeSnapshot, RuntimeUserMessage,
+    RuntimeEvent, RuntimeEvidenceImage, RuntimeHandle, RuntimeLaunchConfig, RuntimeMessageChannel,
+    RuntimeReplyTarget, RuntimeSnapshot, RuntimeUserMessage,
 };
 use crate::stt;
 
 const WIDGET_SOURCE: &str = include_str!("../web/dist/widget.js");
-const MAX_REQUEST_BYTES: usize = 15 * 1024 * 1024;
+const MAX_REQUEST_BYTES: usize = 96 * 1024 * 1024;
 const DEFAULT_BROKER_PORT: u16 = 4317;
 const MAX_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
 const BROWSER_PAGE_STALE_AFTER: Duration = Duration::from_secs(45);
@@ -1011,6 +1012,9 @@ async fn agent_browser_action(
     if !session.browser_control_enabled {
         return browser_control_disabled();
     }
+    if let Err(error) = resolve_browser_screenshot_reference(&session, &mut request.action) {
+        return agent_bad_request(error.to_string());
+    }
     if let Err(error) = validate_browser_action(&mut request.action, &session.allowed_origin) {
         return agent_bad_request(error.to_string());
     }
@@ -1875,7 +1879,7 @@ async fn submit_browser_message(
         channel: RuntimeMessageChannel::Chat,
         text: inbound.text.clone(),
         manifest_path: inbound.manifest_path.clone(),
-        screenshot_path: inbound.screenshot_path.clone(),
+        evidence_images: runtime_evidence_images(&inbound),
         attachment_summaries: inbound
             .attachments
             .iter()
@@ -2018,7 +2022,7 @@ async fn submit_review_message(
         channel: RuntimeMessageChannel::ReviewThread(thread_id.clone()),
         text: inbound.text.clone(),
         manifest_path: inbound.manifest_path.clone(),
-        screenshot_path: inbound.screenshot_path.clone(),
+        evidence_images: runtime_evidence_images(&inbound),
         attachment_summaries: inbound
             .attachments
             .iter()
@@ -2879,9 +2883,132 @@ fn validate_wait(duration: Duration) -> Result<()> {
     Ok(())
 }
 
+fn resolve_browser_screenshot_reference(
+    session: &SessionState,
+    action: &mut BrowserAction,
+) -> Result<()> {
+    let BrowserAction::Screenshot {
+        selector,
+        reference,
+        x,
+        y,
+        width,
+        height,
+        padding,
+    } = action
+    else {
+        return Ok(());
+    };
+    let Some(reference_value) = reference.take() else {
+        return Ok(());
+    };
+    if selector.is_some() || x.is_some() || y.is_some() {
+        bail!("--reference cannot be combined with a selector or document coordinates");
+    }
+    let (message_id, attachment_id) = reference_value
+        .split_once(':')
+        .context("a screenshot reference must use MESSAGE_ID:ATTACHMENT_ID")?;
+    let message_id = Uuid::parse_str(message_id.trim())
+        .context("the screenshot reference message ID is invalid")?
+        .to_string();
+    let attachment_id = attachment_id.trim();
+    if attachment_id.is_empty() {
+        bail!("the screenshot reference attachment ID is empty");
+    }
+    let manifest = find_message_manifest(&session.output, &message_id)?;
+    let attachment = manifest
+        .attachments
+        .iter()
+        .find(|attachment| {
+            attachment.id == attachment_id
+                || attachment.comment.as_deref().is_some_and(|comment| {
+                    comment.starts_with(&format!("[{attachment_id} ·"))
+                        || comment.starts_with(&format!("[{attachment_id} "))
+                })
+        })
+        .with_context(|| format!("message `{message_id}` has no attachment `{attachment_id}`"))?;
+    let viewport = &manifest.page.viewport;
+    *width = Some(width.unwrap_or(viewport.width));
+    *height = Some(height.unwrap_or(viewport.height));
+    if let Some(element) = &attachment.element {
+        *selector = Some(element.selector.clone());
+        return Ok(());
+    }
+    let document_rect = attachment.document_rect.clone().or_else(|| {
+        attachment.rect.as_ref().map(|rect| crate::model::Rect {
+            x: rect.x + viewport.scroll_x,
+            y: rect.y + viewport.scroll_y,
+            width: rect.width,
+            height: rect.height,
+        })
+    });
+    let rect = document_rect.context("the referenced attachment has no page rectangle")?;
+    let capture_width = width.unwrap().max(rect.width + *padding * 2.0);
+    let capture_height = height.unwrap().max(rect.height + *padding * 2.0);
+    *width = Some(capture_width);
+    *height = Some(capture_height);
+    *x = Some((rect.x + rect.width / 2.0 - capture_width / 2.0).max(0.0));
+    *y = Some((rect.y + rect.height / 2.0 - capture_height / 2.0).max(0.0));
+    Ok(())
+}
+
+fn find_message_manifest(output: &Path, message_id: &str) -> Result<MessageManifest> {
+    for entry in std::fs::read_dir(output)
+        .with_context(|| format!("could not read message evidence in {}", output.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path().join("message.json");
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<MessageManifest>(&bytes) else {
+            continue;
+        };
+        if manifest.message_id == message_id {
+            return Ok(manifest);
+        }
+    }
+    bail!("message `{message_id}` has no persisted AgentNudge evidence")
+}
+
 fn validate_browser_action(action: &mut BrowserAction, allowed_origin: &str) -> Result<()> {
     match action {
-        BrowserAction::Snapshot | BrowserAction::Screenshot | BrowserAction::Reload => {}
+        BrowserAction::Snapshot | BrowserAction::Reload => {}
+        BrowserAction::Screenshot {
+            selector,
+            reference,
+            x,
+            y,
+            width,
+            height,
+            padding,
+        } => {
+            if let Some(selector) = selector {
+                sanitize_browser_selector(selector)?;
+            }
+            if reference.is_some() {
+                bail!("the screenshot feedback reference was not resolved");
+            }
+            if selector.is_some() && (x.is_some() || y.is_some()) {
+                bail!("browser screenshot needs either a selector or document coordinates");
+            }
+            for coordinate in [x.as_ref(), y.as_ref()].into_iter().flatten() {
+                if !coordinate.is_finite() || coordinate.abs() > 10_000_000.0 {
+                    bail!("browser screenshot coordinates must be finite and bounded");
+                }
+            }
+            for dimension in [width.as_ref(), height.as_ref()].into_iter().flatten() {
+                if !dimension.is_finite() || !(1.0..=20_000.0).contains(dimension) {
+                    bail!("browser screenshot dimensions must be between 1 and 20000 pixels");
+                }
+            }
+            if !padding.is_finite() || !(0.0..=5_000.0).contains(padding) {
+                bail!("browser screenshot padding must be between 0 and 5000 pixels");
+            }
+        }
         BrowserAction::Click { selector } | BrowserAction::WaitFor { selector } => {
             sanitize_browser_selector(selector)?;
         }
@@ -2923,7 +3050,7 @@ fn browser_result_policy(action: &BrowserAction) -> BrowserResultPolicy {
         BrowserAction::Fill { text, .. } => BrowserResultPolicy::Fill {
             characters: text.chars().count(),
         },
-        BrowserAction::Screenshot => BrowserResultPolicy::Screenshot,
+        BrowserAction::Screenshot { .. } => BrowserResultPolicy::Screenshot,
         _ => BrowserResultPolicy::Standard,
     }
 }
@@ -3026,17 +3153,24 @@ fn finalize_browser_result(
         }
         BrowserResultPolicy::Screenshot => {
             if result.status == "completed" {
-                let data_url = result
+                let value = result
                     .value
                     .as_ref()
-                    .and_then(|value| value.get("screenshotDataUrl"))
+                    .context("a completed screenshot result needs a value")?;
+                let data_url = value
+                    .get("screenshotDataUrl")
                     .and_then(serde_json::Value::as_str)
                     .context("a completed screenshot result needs screenshotDataUrl")?;
+                let page_rect = value.get("pageRect").cloned();
                 let path = persist_browser_screenshot(session, command_id, data_url)?;
-                result.value = Some(json!({
+                let mut receipt = json!({
                     "screenshotPath": path.display().to_string(),
                     "mediaType": "image/png",
-                }));
+                });
+                if let Some(page_rect) = page_rect {
+                    receipt["pageRect"] = page_rect;
+                }
+                result.value = Some(receipt);
                 result.error = None;
             } else {
                 result.value = None;
@@ -3258,7 +3392,25 @@ fn persist_message(
     sequence: u64,
     received_at_unix_ms: u128,
 ) -> Result<InboundMessage> {
-    let screenshot = decode_screenshot(&submission.screenshot_data_url)?;
+    let legacy_screenshot = (!submission.screenshot_data_url.is_empty())
+        .then(|| decode_screenshot(&submission.screenshot_data_url))
+        .transpose()?;
+    let capture_images = submission
+        .captures
+        .iter()
+        .map(|capture| decode_screenshot(&capture.screenshot_data_url))
+        .collect::<Result<Vec<_>>>()?;
+    let overview_image = submission
+        .overview
+        .as_ref()
+        .map(|capture| decode_screenshot(&capture.screenshot_data_url))
+        .transpose()?;
+    let total_image_bytes = legacy_screenshot.as_ref().map_or(0, Vec::len)
+        + capture_images.iter().map(Vec::len).sum::<usize>()
+        + overview_image.as_ref().map_or(0, Vec::len);
+    if total_image_bytes > MAX_EVIDENCE_IMAGE_TOTAL_BYTES {
+        bail!("the evidence images exceed the 64 MiB total limit");
+    }
     std::fs::create_dir_all(output_root).with_context(|| {
         format!(
             "could not create output directory {}",
@@ -3280,10 +3432,49 @@ fn persist_message(
         )
     })?;
 
-    let final_screenshot = final_directory.join("screenshot.png");
+    let legacy_screenshot_path = final_directory.join("screenshot.png");
     let final_manifest = final_directory.join("message.json");
-    std::fs::write(temporary_directory.join("screenshot.png"), screenshot)
-        .context("could not write the screenshot")?;
+    if let Some(screenshot) = legacy_screenshot {
+        std::fs::write(temporary_directory.join("screenshot.png"), screenshot)
+            .context("could not write the screenshot")?;
+    }
+    let temporary_captures = temporary_directory.join("captures");
+    if !capture_images.is_empty() {
+        std::fs::create_dir(&temporary_captures)
+            .context("could not create the evidence capture directory")?;
+    }
+    let captures = submission
+        .captures
+        .iter()
+        .zip(capture_images)
+        .enumerate()
+        .map(|(index, (capture, bytes))| {
+            let file_name = format!("capture-{:02}.png", index + 1);
+            std::fs::write(temporary_captures.join(&file_name), bytes)
+                .context("could not write an evidence capture")?;
+            Ok(persisted_capture(
+                capture,
+                final_directory.join("captures").join(file_name),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let overview = submission
+        .overview
+        .as_ref()
+        .zip(overview_image)
+        .map(|(capture, bytes)| -> Result<EvidenceCapture> {
+            std::fs::write(temporary_directory.join("overview.png"), bytes)
+                .context("could not write the evidence overview")?;
+            Ok(persisted_capture(
+                capture,
+                final_directory.join("overview.png"),
+            ))
+        })
+        .transpose()?;
+    let final_screenshot = captures
+        .first()
+        .map(|capture| PathBuf::from(&capture.screenshot_path))
+        .unwrap_or(legacy_screenshot_path);
 
     let manifest = MessageManifest {
         version: PROTOCOL_VERSION,
@@ -3295,6 +3486,8 @@ fn persist_message(
         page: submission.page.clone(),
         attachments: submission.attachments.clone(),
         screenshot_path: final_screenshot.display().to_string(),
+        captures: captures.clone(),
+        overview: overview.clone(),
         trust: TrustBoundary::untrusted_page(),
     };
     std::fs::write(
@@ -3319,8 +3512,41 @@ fn persist_message(
             .collect(),
         manifest_path: final_manifest.display().to_string(),
         screenshot_path: final_screenshot.display().to_string(),
+        captures,
+        overview,
         trust: TrustBoundary::untrusted_page(),
     })
+}
+
+fn persisted_capture(capture: &EvidenceCaptureSubmission, path: PathBuf) -> EvidenceCapture {
+    EvidenceCapture {
+        id: capture.id.clone(),
+        kind: capture.kind.clone(),
+        page_rect: capture.page_rect.clone(),
+        attachment_ids: capture.attachment_ids.clone(),
+        screenshot_path: path.display().to_string(),
+    }
+}
+
+fn runtime_evidence_images(inbound: &InboundMessage) -> Vec<RuntimeEvidenceImage> {
+    let mut images = Vec::new();
+    if let Some(overview) = &inbound.overview {
+        images.push(RuntimeEvidenceImage {
+            label: "overview".into(),
+            path: overview.screenshot_path.clone(),
+        });
+    }
+    images.extend(inbound.captures.iter().map(|capture| RuntimeEvidenceImage {
+        label: capture.id.clone(),
+        path: capture.screenshot_path.clone(),
+    }));
+    if images.is_empty() && !inbound.screenshot_path.is_empty() {
+        images.push(RuntimeEvidenceImage {
+            label: "annotated viewport".into(),
+            path: inbound.screenshot_path.clone(),
+        });
+    }
+    images
 }
 
 fn decode_screenshot(value: &str) -> Result<Vec<u8>> {
@@ -3478,7 +3704,10 @@ async fn parse_response<T: serde::de::DeserializeOwned>(response: reqwest::Respo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AttachmentKind, ContextAttachment, PageContext, Rect, Viewport};
+    use crate::model::{
+        AttachmentKind, ContextAttachment, EvidenceCaptureKind, EvidenceCaptureSubmission,
+        PageContext, Rect, Viewport,
+    };
 
     const ONE_PIXEL_PNG: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
 
@@ -3506,11 +3735,15 @@ mod tests {
                     width: 30.0,
                     height: 40.0,
                 }),
+                document_rect: None,
+                capture_id: None,
                 element: None,
                 comment: None,
                 strokes: vec![],
             }],
             screenshot_data_url: ONE_PIXEL_PNG.into(),
+            captures: vec![],
+            overview: None,
         }
     }
 
@@ -3635,6 +3868,147 @@ mod tests {
             inbound.attachments[0].summary,
             "region x=10 y=20 width=30 height=40"
         );
+    }
+
+    #[test]
+    fn persists_multiple_viewports_and_an_overview_in_one_atomic_bundle() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut submission = submission("lima");
+        submission.screenshot_data_url.clear();
+        submission.attachments[0].capture_id = Some("V1".into());
+        submission.attachments[0].document_rect = Some(Rect {
+            x: 10.0,
+            y: 20.0,
+            width: 30.0,
+            height: 40.0,
+        });
+        submission.captures = vec![
+            EvidenceCaptureSubmission {
+                id: "V1".into(),
+                kind: EvidenceCaptureKind::Viewport,
+                page_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                attachment_ids: vec!["attachment-1".into()],
+                screenshot_data_url: ONE_PIXEL_PNG.into(),
+            },
+            EvidenceCaptureSubmission {
+                id: "V2".into(),
+                kind: EvidenceCaptureKind::Viewport,
+                page_rect: Rect {
+                    x: 0.0,
+                    y: 5_000.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                attachment_ids: vec![],
+                screenshot_data_url: ONE_PIXEL_PNG.into(),
+            },
+        ];
+        submission.overview = Some(EvidenceCaptureSubmission {
+            id: "overview".into(),
+            kind: EvidenceCaptureKind::Overview,
+            page_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 8_000.0,
+            },
+            attachment_ids: vec!["attachment-1".into()],
+            screenshot_data_url: ONE_PIXEL_PNG.into(),
+        });
+        let submission = submission.validate_and_sanitize("lima").unwrap();
+
+        let inbound = persist_message(
+            &submission,
+            temporary.path(),
+            "lima",
+            "message-87654321",
+            1,
+            1_785_840_000_000,
+        )
+        .unwrap();
+
+        assert_eq!(inbound.captures.len(), 2);
+        assert!(inbound.overview.is_some());
+        assert_eq!(inbound.screenshot_path, inbound.captures[0].screenshot_path);
+        assert!(
+            inbound
+                .captures
+                .iter()
+                .all(|capture| Path::new(&capture.screenshot_path).is_file())
+        );
+        assert!(Path::new(&inbound.overview.unwrap().screenshot_path).is_file());
+        let manifest: MessageManifest =
+            serde_json::from_slice(&std::fs::read(inbound.manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest.captures[1].id, "V2");
+        assert_eq!(manifest.overview.unwrap().id, "overview");
+    }
+
+    #[tokio::test]
+    async fn resolves_a_feedback_reference_into_a_non_disruptive_screenshot_region() {
+        let temporary = tempfile::tempdir().unwrap();
+        let broker = broker();
+        let created = register_session(
+            &broker,
+            "http://localhost:5173".into(),
+            temporary.path().to_path_buf(),
+            true,
+        )
+        .await
+        .unwrap();
+        let session = find_session(&broker, &created.session).await.unwrap();
+        let message_id = Uuid::new_v4().to_string();
+        let mut value = submission(&created.session);
+        value.page.viewport.width = 800.0;
+        value.page.viewport.height = 600.0;
+        value.attachments[0].document_rect = Some(Rect {
+            x: 100.0,
+            y: 5_200.0,
+            width: 200.0,
+            height: 100.0,
+        });
+        persist_message(
+            &value,
+            &session.output,
+            &created.session,
+            &message_id,
+            1,
+            1_785_840_000_000,
+        )
+        .unwrap();
+        let mut action = BrowserAction::Screenshot {
+            selector: None,
+            reference: Some(format!("{message_id}:attachment-1")),
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            padding: 300.0,
+        };
+
+        resolve_browser_screenshot_reference(&session, &mut action).unwrap();
+
+        match action {
+            BrowserAction::Screenshot {
+                reference,
+                x,
+                y,
+                width,
+                height,
+                ..
+            } => {
+                assert!(reference.is_none());
+                assert_eq!(x, Some(0.0));
+                assert_eq!(y, Some(4_900.0));
+                assert_eq!(width, Some(800.0));
+                assert_eq!(height, Some(700.0));
+            }
+            _ => panic!("expected a screenshot action"),
+        }
     }
 
     #[test]
@@ -3788,12 +4162,70 @@ mod tests {
         .await
         .unwrap();
         let session = find_session(&broker, &created.session).await.unwrap();
+        let mut review = submission(&created.session);
+        let mut lower_attachment = review.attachments[0].clone();
+        lower_attachment.id = "attachment-2".into();
+        lower_attachment.rect = Some(Rect {
+            x: 40.0,
+            y: 60.0,
+            width: 30.0,
+            height: 40.0,
+        });
+        lower_attachment.document_rect = Some(Rect {
+            x: 40.0,
+            y: 5_260.0,
+            width: 30.0,
+            height: 40.0,
+        });
+        lower_attachment.capture_id = Some("V2".into());
+        review.attachments[0].document_rect = review.attachments[0].rect.clone();
+        review.attachments[0].capture_id = Some("V1".into());
+        review.attachments.push(lower_attachment);
+        review.screenshot_data_url.clear();
+        review.captures = vec![
+            EvidenceCaptureSubmission {
+                id: "V1".into(),
+                kind: EvidenceCaptureKind::Viewport,
+                page_rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                attachment_ids: vec!["attachment-1".into()],
+                screenshot_data_url: ONE_PIXEL_PNG.into(),
+            },
+            EvidenceCaptureSubmission {
+                id: "V2".into(),
+                kind: EvidenceCaptureKind::Viewport,
+                page_rect: Rect {
+                    x: 0.0,
+                    y: 5_200.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                attachment_ids: vec!["attachment-2".into()],
+                screenshot_data_url: ONE_PIXEL_PNG.into(),
+            },
+        ];
+        review.overview = Some(EvidenceCaptureSubmission {
+            id: "overview".into(),
+            kind: EvidenceCaptureKind::Overview,
+            page_rect: Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 8_000.0,
+            },
+            attachment_ids: vec!["attachment-1".into(), "attachment-2".into()],
+            screenshot_data_url: ONE_PIXEL_PNG.into(),
+        });
 
         let submitted = submit_feedback(
             AxumPath(created.session.clone()),
             State(broker.clone()),
             browser_headers(&session),
-            Json(submission(&created.session)),
+            Json(review),
         )
         .await;
         assert_eq!(submitted.status(), StatusCode::ACCEPTED);
@@ -3805,6 +4237,8 @@ mod tests {
             received.message.as_ref().unwrap().message_id,
             receipt.message_id
         );
+        assert_eq!(received.message.as_ref().unwrap().captures.len(), 2);
+        assert!(received.message.as_ref().unwrap().overview.is_some());
         assert!(session.conversation.lock().await.messages.is_empty());
     }
 
@@ -4521,7 +4955,15 @@ for line in sys.stdin:
                 Query(WaitQuery { timeout_ms: 2_000 }),
                 Json(BrowserActionRequest {
                     page_id: None,
-                    action: BrowserAction::Screenshot,
+                    action: BrowserAction::Screenshot {
+                        selector: None,
+                        reference: None,
+                        x: None,
+                        y: None,
+                        width: None,
+                        height: None,
+                        padding: 0.0,
+                    },
                 }),
             )
             .await
@@ -4545,7 +4987,7 @@ for line in sys.stdin:
         .await;
         let delivered: BrowserCommandPollResponse = response_json(delivered).await;
         let command = delivered.command.unwrap();
-        assert!(matches!(command.action, BrowserAction::Screenshot));
+        assert!(matches!(command.action, BrowserAction::Screenshot { .. }));
 
         let rejected = browser_command_result(
             AxumPath((session_id.clone(), command.command_id.clone())),
@@ -4580,7 +5022,10 @@ for line in sys.stdin:
                 command_id: command.command_id,
                 page_id: PAGE_ID.into(),
                 status: "completed".into(),
-                value: Some(json!({"screenshotDataUrl": ONE_PIXEL_PNG})),
+                value: Some(json!({
+                    "screenshotDataUrl": ONE_PIXEL_PNG,
+                    "pageRect": {"x": 0, "y": 4200, "width": 800, "height": 600}
+                })),
                 error: None,
                 current_url: "http://localhost:5173/?private=yes".into(),
                 title: "Demo".into(),
@@ -4607,6 +5052,7 @@ for line in sys.stdin:
         );
         assert_eq!(std::fs::read(screenshot_path).unwrap(), png_bytes());
         assert_eq!(response.value.as_ref().unwrap()["mediaType"], "image/png");
+        assert_eq!(response.value.as_ref().unwrap()["pageRect"]["y"], 4200);
     }
 
     #[tokio::test]

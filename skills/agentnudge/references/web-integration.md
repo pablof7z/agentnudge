@@ -36,4 +36,4 @@ Do not expand capture to console logs, network traffic, browser storage, form va
 
 ## Understand screenshot limits
 
-The annotated screenshot includes selected elements, rectangular regions, freehand drawings, and their matching numbers. Cross-origin images, iframes, canvas content, and video may not render in DOM-based screenshots. If capture fails, report it visibly and use the structured attachment metadata; never silently substitute an unrelated image.
+Comments mode groups nearby marks into the viewport where they were created and captures distant page regions separately. The evidence bundle also includes a small whole-page overview whose numbered rectangles match the detailed viewport IDs. Each detailed screenshot includes its selected elements, rectangular regions, freehand drawings, and matching reference numbers. Cross-origin images, iframes, canvas content, and video may not render in DOM-based screenshots. If capture fails, report it visibly and use the structured attachment metadata; never silently substitute an unrelated image.

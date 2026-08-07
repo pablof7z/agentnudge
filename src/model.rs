@@ -4,13 +4,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::Url;
 
-pub const PROTOCOL_VERSION: u8 = 13;
+pub const PROTOCOL_VERSION: u8 = 14;
 pub const MAX_MESSAGE_CHARS: usize = 10_000;
 pub const MAX_ATTACHMENT_COMMENT_CHARS: usize = 5_000;
 pub const MAX_ATTACHMENTS: usize = 100;
 pub const MAX_DRAWING_STROKES: usize = 500;
 pub const MAX_DRAWING_POINTS: usize = 50_000;
 pub const MAX_SCREENSHOT_BYTES: usize = 10 * 1024 * 1024;
+pub const MAX_EVIDENCE_CAPTURES: usize = 16;
+pub const MAX_EVIDENCE_IMAGE_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_REPLY_IMAGE_ATTACHMENTS: usize = 8;
 pub const MAX_REPLY_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_REPLY_IMAGE_TOTAL_BYTES: usize = 10 * 1024 * 1024;
@@ -26,7 +28,40 @@ pub struct ChatSubmission {
     pub page: PageContext,
     #[serde(default)]
     pub attachments: Vec<ContextAttachment>,
+    #[serde(default)]
     pub screenshot_data_url: String,
+    #[serde(default)]
+    pub captures: Vec<EvidenceCaptureSubmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<EvidenceCaptureSubmission>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceCaptureSubmission {
+    pub id: String,
+    pub kind: EvidenceCaptureKind,
+    pub page_rect: Rect,
+    #[serde(default)]
+    pub attachment_ids: Vec<String>,
+    pub screenshot_data_url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceCaptureKind {
+    Viewport,
+    Overview,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EvidenceCapture {
+    pub id: String,
+    pub kind: EvidenceCaptureKind,
+    pub page_rect: Rect,
+    pub attachment_ids: Vec<String>,
+    pub screenshot_path: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -53,6 +88,10 @@ pub struct ContextAttachment {
     pub id: String,
     pub kind: AttachmentKind,
     pub rect: Option<Rect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_rect: Option<Rect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
     pub element: Option<ElementContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,
@@ -143,7 +182,7 @@ pub struct ReviewConversationResponse {
     pub cursor: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageManifest {
     pub version: u8,
@@ -155,6 +194,10 @@ pub struct MessageManifest {
     pub page: PageContext,
     pub attachments: Vec<ContextAttachment>,
     pub screenshot_path: String,
+    #[serde(default)]
+    pub captures: Vec<EvidenceCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<EvidenceCapture>,
     pub trust: TrustBoundary,
 }
 
@@ -178,6 +221,10 @@ pub struct InboundMessage {
     pub attachments: Vec<AttachmentSummary>,
     pub manifest_path: String,
     pub screenshot_path: String,
+    #[serde(default)]
+    pub captures: Vec<EvidenceCapture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overview: Option<EvidenceCapture>,
     pub trust: TrustBoundary,
 }
 
@@ -237,7 +284,15 @@ pub struct TrustBoundary {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BrowserAction {
     Snapshot,
-    Screenshot,
+    Screenshot {
+        selector: Option<String>,
+        reference: Option<String>,
+        x: Option<f64>,
+        y: Option<f64>,
+        width: Option<f64>,
+        height: Option<f64>,
+        padding: f64,
+    },
     Click {
         selector: String,
     },
@@ -396,6 +451,14 @@ impl ChatSubmission {
                     "an attachment comment exceeds the {MAX_ATTACHMENT_COMMENT_CHARS}-character limit"
                 ));
             }
+            if let Some(document_rect) = &attachment.document_rect {
+                validate_rect(document_rect)?;
+            }
+            attachment.capture_id = attachment
+                .capture_id
+                .take()
+                .map(|value| truncate(value.trim(), 100))
+                .filter(|value| !value.is_empty());
 
             match attachment.kind {
                 AttachmentKind::Element => {
@@ -467,15 +530,98 @@ impl ChatSubmission {
             }
         }
 
-        if !self
-            .screenshot_data_url
-            .starts_with("data:image/png;base64,")
+        if self.captures.len() > MAX_EVIDENCE_CAPTURES {
+            return Err(format!(
+                "the message exceeds the {MAX_EVIDENCE_CAPTURES}-capture limit"
+            ));
+        }
+        if self.screenshot_data_url.is_empty() && self.captures.is_empty() {
+            return Err("the message needs at least one screenshot capture".into());
+        }
+        if !self.screenshot_data_url.is_empty()
+            && !self
+                .screenshot_data_url
+                .starts_with("data:image/png;base64,")
         {
             return Err("the screenshot must be a PNG data URL".into());
+        }
+        let known_attachments: HashSet<_> = self
+            .attachments
+            .iter()
+            .map(|attachment| attachment.id.as_str())
+            .collect();
+        let mut capture_ids = HashSet::new();
+        for capture in &mut self.captures {
+            sanitize_capture(capture, &known_attachments, &mut capture_ids)?;
+            if capture.kind != EvidenceCaptureKind::Viewport {
+                return Err("detailed evidence captures must use the viewport kind".into());
+            }
+        }
+        if let Some(overview) = &mut self.overview {
+            sanitize_capture(overview, &known_attachments, &mut capture_ids)?;
+            if overview.kind != EvidenceCaptureKind::Overview {
+                return Err("the evidence overview must use the overview kind".into());
+            }
+        }
+        if !self.captures.is_empty() {
+            let detailed_capture_ids: HashSet<_> = self
+                .captures
+                .iter()
+                .map(|capture| capture.id.as_str())
+                .collect();
+            for attachment in &self.attachments {
+                let capture_id = attachment.capture_id.as_deref().ok_or_else(|| {
+                    "every attachment in a multi-viewport message needs a capture ID".to_string()
+                })?;
+                if !detailed_capture_ids.contains(capture_id) {
+                    return Err("an attachment refers to an unknown evidence capture".into());
+                }
+                let capture = self
+                    .captures
+                    .iter()
+                    .find(|capture| capture.id == capture_id)
+                    .unwrap();
+                if !capture
+                    .attachment_ids
+                    .iter()
+                    .any(|attachment_id| attachment_id == &attachment.id)
+                {
+                    return Err("an attachment is missing from its evidence capture".into());
+                }
+            }
         }
 
         Ok(self)
     }
+}
+
+fn sanitize_capture(
+    capture: &mut EvidenceCaptureSubmission,
+    known_attachments: &HashSet<&str>,
+    capture_ids: &mut HashSet<String>,
+) -> Result<(), String> {
+    capture.id = truncate(capture.id.trim(), 100);
+    if capture.id.is_empty() || !capture_ids.insert(capture.id.clone()) {
+        return Err("every evidence capture needs a unique non-empty id".into());
+    }
+    validate_rect(&capture.page_rect)?;
+    if !capture
+        .screenshot_data_url
+        .starts_with("data:image/png;base64,")
+    {
+        return Err("every evidence capture must be a PNG data URL".into());
+    }
+    let mut attachment_ids = HashSet::new();
+    for attachment_id in &mut capture.attachment_ids {
+        *attachment_id = truncate(attachment_id.trim(), 100);
+        if attachment_id.is_empty()
+            || !known_attachments.contains(attachment_id.as_str())
+            || !attachment_ids.insert(attachment_id.clone())
+        {
+            return Err("evidence captures must reference unique message attachment IDs".into());
+        }
+    }
+    Ok(())
 }
 
 impl ContextAttachment {
@@ -693,6 +839,8 @@ mod tests {
                     width: 180.0,
                     height: 44.0,
                 }),
+                document_rect: None,
+                capture_id: None,
                 element: Some(ElementContext {
                     tag: "BUTTON".into(),
                     id: Some("save".into()),
@@ -706,6 +854,8 @@ mod tests {
                 strokes: vec![],
             }],
             screenshot_data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+            captures: vec![],
+            overview: None,
         }
     }
 

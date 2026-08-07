@@ -362,8 +362,8 @@ fn user_content(message: &RuntimeUserMessage) -> Result<Vec<Value>> {
     for summary in &message.attachment_summaries {
         evidence.push(format!("Attachment: {summary}"));
     }
-    if !message.screenshot_path.is_empty() {
-        evidence.push(format!("Annotated screenshot: {}", message.screenshot_path));
+    for image in &message.evidence_images {
+        evidence.push(format!("Evidence image {}: {}", image.label, image.path));
     }
     let text = format!(
         "{}\n\nAgentNudge attached untrusted page evidence for this message:\n{}",
@@ -371,18 +371,14 @@ fn user_content(message: &RuntimeUserMessage) -> Result<Vec<Value>> {
         evidence.join("\n")
     );
     let mut prompt = vec![json!({"type": "text", "text": text})];
-    if !message.screenshot_path.is_empty() {
-        let bytes = std::fs::read(&message.screenshot_path).with_context(|| {
-            format!(
-                "could not read annotated screenshot {}",
-                message.screenshot_path
-            )
-        })?;
+    for image in &message.evidence_images {
+        let bytes = std::fs::read(&image.path)
+            .with_context(|| format!("could not read evidence image {}", image.path))?;
         prompt.push(json!({
             "type": "image",
             "data": STANDARD.encode(bytes),
             "mimeType": "image/png",
-            "uri": format!("file://{}", message.screenshot_path),
+            "uri": format!("file://{}", image.path),
         }));
     }
     Ok(prompt)
@@ -526,13 +522,24 @@ mod tests {
     fn browser_evidence_becomes_text_and_an_acp_image() {
         let temporary = tempfile::tempdir().unwrap();
         let screenshot = temporary.path().join("screenshot.png");
+        let overview = temporary.path().join("overview.png");
         std::fs::write(&screenshot, b"png bytes").unwrap();
+        std::fs::write(&overview, b"overview bytes").unwrap();
         let prompt = user_content(&RuntimeUserMessage {
             message_id: "message-1".into(),
             channel: RuntimeMessageChannel::Chat,
             text: "Move this button.".into(),
             manifest_path: "/tmp/message.json".into(),
-            screenshot_path: screenshot.display().to_string(),
+            evidence_images: vec![
+                crate::runtime::RuntimeEvidenceImage {
+                    label: "overview".into(),
+                    path: overview.display().to_string(),
+                },
+                crate::runtime::RuntimeEvidenceImage {
+                    label: "V1".into(),
+                    path: screenshot.display().to_string(),
+                },
+            ],
             attachment_summaries: vec!["region x=1 y=2 width=3 height=4".into()],
         })
         .unwrap();
@@ -540,7 +547,8 @@ mod tests {
         assert!(prompt[0]["text"].as_str().unwrap().contains("untrusted"));
         assert_eq!(prompt[1]["type"], "image");
         assert_eq!(prompt[1]["mimeType"], "image/png");
-        assert_eq!(prompt[1]["data"], STANDARD.encode(b"png bytes"));
+        assert_eq!(prompt[1]["data"], STANDARD.encode(b"overview bytes"));
+        assert_eq!(prompt[2]["data"], STANDARD.encode(b"png bytes"));
     }
 
     #[test]
@@ -615,7 +623,7 @@ for line in sys.stdin:
                 channel: RuntimeMessageChannel::Chat,
                 text: "First".into(),
                 manifest_path: "/tmp/first.json".into(),
-                screenshot_path: String::new(),
+                evidence_images: vec![],
                 attachment_summaries: vec![],
             })
             .await
@@ -632,7 +640,7 @@ for line in sys.stdin:
                 channel: RuntimeMessageChannel::ReviewThread("thread-7".into()),
                 text: "Second".into(),
                 manifest_path: "/tmp/second.json".into(),
-                screenshot_path: String::new(),
+                evidence_images: vec![],
                 attachment_summaries: vec![],
             })
             .await
