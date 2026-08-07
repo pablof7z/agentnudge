@@ -8,6 +8,25 @@ Unsent review threads are kept in the local broker and restored after a page rel
 
 The local/manual bridge needs no account, hosted service, browser extension, or multi-computer transport. Embedded modes use the machine's existing Codex or Claude authentication.
 
+## Install
+
+On macOS or Linux, install the latest release into `~/.local/bin`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/pablof7z/agentnudge/releases/latest/download/install.sh | sh
+```
+
+On 64-bit Windows, run this in PowerShell:
+
+```powershell
+irm https://github.com/pablof7z/agentnudge/releases/latest/download/install.ps1 | iex
+```
+
+Set `AGENTNUDGE_INSTALL_DIR` to choose another destination. Set `AGENTNUDGE_VERSION` to a release such as `v0.1.0` to install that exact version. The installers select the native archive, verify it against the release's `SHA256SUMS`, install the binary, and execute `agentnudge --version` before returning.
+
+Prebuilt release archives cover Apple Silicon and Intel macOS, ARM64 and x64 Linux, and x64 Windows. They include the compiled widget, so using AgentNudge does not require Rust or Node.js. Archives and checksums are also available directly from [GitHub Releases](https://github.com/pablof7z/agentnudge/releases).
+
 ## Agent skill
 
 Reusable agent instructions live in [`skills/agentnudge`](skills/agentnudge). Install or reference that folder from an agent's skill directory, then invoke `$agentnudge` to add and operate the local feedback loop.

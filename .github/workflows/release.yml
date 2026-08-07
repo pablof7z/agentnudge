@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Match tag and Cargo version
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test -n "$cargo_version"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            test "${GITHUB_REF_NAME}" = "v${cargo_version}"
+          fi
+          printf 'Building AgentNudge %s\n' "$cargo_version"
+
+      - name: Validate Unix release scripts
+        run: sh -n scripts/install.sh scripts/package-release.sh
+
+      - name: Validate PowerShell release scripts
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$null, [ref]$errors) | Out-Null
+          [System.Management.Automation.Language.Parser]::ParseFile("scripts/package-release.ps1", [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            archive: tar.gz
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build binary
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          scripts/package-release.sh \
+            "${{ matrix.target }}" \
+            "$version" \
+            dist \
+            "target/${{ matrix.target }}/release/agentnudge"
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]*)"$').Matches[0].Groups[1].Value
+          ./scripts/package-release.ps1 `
+            -Target "${{ matrix.target }}" `
+            -Version $version `
+            -OutputDir dist `
+            -Binary "target/${{ matrix.target }}/release/agentnudge.exe"
+
+      - name: Smoke-test Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          mkdir smoke
+          tar -C smoke -xzf "dist/agentnudge-${{ matrix.target }}.tar.gz"
+          "smoke/agentnudge-${{ matrix.target }}/agentnudge" --version
+
+      - name: Smoke-test Windows archive and installer
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $archive = "agentnudge-${{ matrix.target }}.zip"
+          Expand-Archive -LiteralPath "dist/$archive" -DestinationPath smoke
+          & "smoke/agentnudge-${{ matrix.target }}/agentnudge.exe" --version
+
+          $hash = (Get-FileHash -LiteralPath "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "dist/SHA256SUMS" -Value "$hash  $archive"
+          $server = Start-Process python -ArgumentList "-m", "http.server", "8123", "--directory", "dist" -PassThru
+          try {
+            Start-Sleep -Seconds 2
+            ./scripts/install.ps1 `
+              -InstallDir "$env:RUNNER_TEMP/agentnudge-bin" `
+              -ReleaseUrl "http://127.0.0.1:8123"
+            & "$env:RUNNER_TEMP/agentnudge-bin/agentnudge.exe" --version
+          }
+          finally {
+            Stop-Process -Id $server.Id -Force -ErrorAction SilentlyContinue
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentnudge-${{ matrix.target }}
+          path: dist/agentnudge-${{ matrix.target }}.${{ matrix.archive }}
+          if-no-files-found: error
+
+  assemble:
+    name: Verify release bundle
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: agentnudge-*
+          path: release
+          merge-multiple: true
+
+      - name: Add installers and checksums
+        run: |
+          cp scripts/install.sh release/install.sh
+          cp scripts/install.ps1 release/install.ps1
+          cd release
+          sha256sum agentnudge-* install.sh install.ps1 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Exercise Unix installer against assembled bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m http.server 8123 --directory release >"$RUNNER_TEMP/agentnudge-http.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for _ in {1..20}; do
+            curl --fail --silent http://127.0.0.1:8123/SHA256SUMS >/dev/null && break
+            sleep 0.25
+          done
+          AGENTNUDGE_RELEASE_URL=http://127.0.0.1:8123 \
+            AGENTNUDGE_INSTALL_DIR="$RUNNER_TEMP/agentnudge-bin" \
+            sh scripts/install.sh
+          "$RUNNER_TEMP/agentnudge-bin/agentnudge" --version
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: agentnudge-release-bundle
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: assemble
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: agentnudge-release-bundle
+          path: release
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
