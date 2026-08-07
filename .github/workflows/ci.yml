@@ -36,6 +36,9 @@ jobs:
       - name: Check generated widget
         run: git diff --exit-code -- web/dist/widget.js
 
+      - name: Validate release scripts
+        run: sh -n scripts/install.sh scripts/package-release.sh
+
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -44,3 +47,6 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Build release binary
+        run: cargo build --locked --release
